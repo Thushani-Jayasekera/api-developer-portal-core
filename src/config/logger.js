@@ -160,6 +160,31 @@ if (!consoleOnly) {
     });
 }
 
+// Dedicated agent activity logger — separate file from human audit logs so agent
+// traffic can be monitored, alerted on, and retained independently.
+let agentFileLogger = null;
+if (!consoleOnly) {
+    agentFileLogger = winston.createLogger({
+        level: 'info',
+        format: winston.format.combine(
+            winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+            winston.format.printf((info) => {
+                const { timestamp, message, ...meta } = info;
+                return `[${timestamp}][AGENT] ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ''}`.trimEnd();
+            })
+        ),
+        transports: [
+            new DailyRotateFile({
+                filename: path.join(process.cwd(), 'logs', 'agent-%DATE%.log'),
+                datePattern: 'YYYY-MM-DD',
+                maxSize: '50m',
+                maxFiles: '90d',
+                level: 'info',
+            })
+        ]
+    });
+}
+
 // Function to get caller information (file and line number)
 function getCallerInfo() {
     const originalFunc = Error.prepareStackTrace;
@@ -217,14 +242,28 @@ const enhancedLogger = {
     audit: (message, meta = {}) => {
         const loggingConfig = config.logging || {};
         const consoleOnly = loggingConfig.consoleOnly || process.env.LOG_CONSOLE_ONLY === 'true';
-        
+
         // Always log audit messages to console with [AUDIT] prefix
         const caller = getCallerInfo();
         logger.info(`[AUDIT] ${message}`, { ...meta, ...caller });
-        
+
         // Also log to separate audit file if file logging is enabled
         if (!consoleOnly && auditFileLogger) {
             auditFileLogger.info(message, meta);
+        }
+    },
+
+    // Agent activity logging — writes to agent-YYYY-MM-DD.log (separate from human audit)
+    agent: (message, meta = {}) => {
+        const loggingConfig = config.logging || {};
+        const consoleOnly = loggingConfig.consoleOnly || process.env.LOG_CONSOLE_ONLY === 'true';
+
+        // Console output so agent activity is visible in dev
+        logger.info(`[AGENT] ${message}`, meta);
+
+        // Dedicated file for production monitoring / SIEM ingestion
+        if (!consoleOnly && agentFileLogger) {
+            agentFileLogger.info(message, meta);
         }
     }
 };

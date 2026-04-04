@@ -33,6 +33,7 @@ const adminService = require('../services/adminService');
 const subscriptionPolicyDTO = require('../dto/subscriptionPolicy');
 const { ApplicationDTO } = require('../dto/application');
 const APIDTO = require('../dto/apiDTO');
+const { toAgentApiListResponse, toAgentApiDetail, toAgentMCPDetail, isHiddenFromAgents } = require('../dto/agentApiDTO');
 const { buildSchema, getIntrospectionQuery, graphql: executeGraphQL } = require('graphql');
 const { log } = require('console');
 const controlPlaneUrl = config.controlPlane.url;
@@ -180,6 +181,12 @@ const loadAPIs = async (req, res) => {
                 isReadOnlyMode: config.readOnlyMode,
                 applications: allApplications.map(app => new ApplicationDTO(app)) // top-level applications array
             };
+
+            if (req.wantsJSON) {
+                const isMCPView = req.originalUrl.includes('/mcps');
+                const baseUrl = '/' + orgName + constants.ROUTE.VIEWS_PATH + viewName;
+                return res.json(toAgentApiListResponse(metaDataList, baseUrl, isMCPView));
+            }
 
             if (req.originalUrl.includes("/mcps")) {
                 html = await renderTemplateFromAPI(templateContent, orgID, orgName, "pages/mcp", viewName);
@@ -462,6 +469,18 @@ const loadAPIContent = async (req, res) => {
                 isFederatedAPI: isFederatedAPI,
             };
             templateContent.showPlatformApiKeysNav = await shouldShowPlatformApiKeysNav(req, metaData, apiDetail);
+
+            if (req.wantsJSON) {
+                if (isHiddenFromAgents(metaData)) {
+                    return res.status(404).json({ error: 'not_found', message: 'API not found.' });
+                }
+                const baseUrl = '/' + orgName + constants.ROUTE.VIEWS_PATH + viewName;
+                if (metaData.apiInfo.apiType === 'MCP') {
+                    return res.json(toAgentMCPDetail(metaData, schemaDefinition, baseUrl));
+                }
+                return res.json(toAgentApiDetail(metaData, apiDetail?.scopes, baseUrl));
+            }
+
             if (metaData.apiInfo.apiType == "MCP") {
                 html = await renderTemplateFromAPI(templateContent, orgID, orgName, "pages/mcp-landing", viewName);
             } else {
@@ -744,6 +763,20 @@ const loadDocument = async (req, res) => {
                 templateContent.asyncapi = JSON.stringify(modifiedAsyncAPI);
             }
             templateContent.isAPIDefinition = true;
+
+            // Agent JSON fork: return raw spec instead of HTML
+            if (req.wantsJSON) {
+                if (templateContent.swagger) {
+                    return res.json(JSON.parse(templateContent.swagger));
+                }
+                if (templateContent.asyncapi) {
+                    return res.json(JSON.parse(templateContent.asyncapi));
+                }
+                if (templateContent.graphql) {
+                    return res.json({ schema: definitionResponse.graphql });
+                }
+                return res.status(404).json({ error: 'not_found', message: 'Specification not available for this API type.' });
+            }
         }
         if (config.mode === constants.DEV_MODE) {
             const apiMetadata = await loadAPIMetaDataFromFile(apiHandle);

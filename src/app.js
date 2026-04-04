@@ -28,6 +28,10 @@ const https = require('https');
 const fs = require('fs');
 const logger = require('./config/logger');
 const { auditMiddleware } = require('./middlewares/auditLogger');
+const agentNegotiation = require('./middlewares/agentNegotiation');
+const agentActivityLogger = require('./middlewares/agentActivityLogger');
+const adminDao = require('./dao/admin');
+const apiDao = require('./dao/apiMetadata');
 const authRoute = require('./routes/authRoute');
 const devportalRoute = require('./routes/devportalRoute');
 const orgContent = require('./routes/orgContentRoute');
@@ -349,11 +353,19 @@ app.post('/webhooks/stripe/:orgId', express.raw({ type: 'application/json' }), b
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Add audit logging middleware
+// Add audit logging middleware (human traffic)
 app.use(auditMiddleware({
     excludePaths: ['/health', '/metrics', '/favicon.ico', '/styles', '/scripts', '/images', '/technical-styles', '/technical-scripts'],
     sensitiveFields: ['password', 'token', 'secret', 'key', 'authorization', 'idToken', 'accessToken', 'refreshToken']
 }));
+
+// Agent request detection — must run before agentActivityLogger so req.wantsJSON is set
+app.use(agentNegotiation);
+
+// Agent activity logging & anomaly detection — only activates when req.wantsJSON is true.
+// Logs to agent-YYYY-MM-DD.log (separate from human audit log) and warns on anomalies.
+// Thresholds can be tuned via config.agentMonitoring in config.json.
+app.use(agentActivityLogger);
 
 app.use(passport.initialize());
 app.use(passport.session());
@@ -550,6 +562,235 @@ passport.deserializeUser(async (sessionData, done) => {
 
 app.use(constants.ROUTE.TECHNICAL_STYLES, express.static(path.join(require.main.filename, '../styles')));
 app.use(constants.ROUTE.TECHNICAL_SCRIPTS, express.static(path.join(require.main.filename, '../scripts')));
+
+// ─── Shared helpers for agent.json responses ─────────────────────────────────
+
+/**
+ * Builds the authentication section shared by both agent discovery endpoints.
+ * Reads IDP URLs from config so agents know how to obtain credentials upfront.
+ */
+function buildAgentAuthSection() {
+    return {
+        schemes: [
+            {
+                type: 'bearer',
+                description: 'OAuth2 Bearer token. Required for subscriptions, applications, and key generation.',
+                agent_instructions: 'Ask the user to provide their Bearer token, then include it as "Authorization: Bearer <token>" on each authenticated request.',
+            },
+            {
+                type: 'apikey',
+                description: 'Portal-level API key for service-to-service access. Does not grant user-scoped actions (subscriptions, key generation).',
+                agent_instructions: 'Ask the user to provide their API key, then include it in the request header specified in the "header" field.',
+            },
+        ],
+        hint: 'Read-only discovery requires no authentication. To subscribe to APIs or generate keys, authenticate as a user via Bearer token.',
+    };
+}
+
+/**
+ * Access-level descriptions shared by both agent discovery endpoints.
+ * Each API in the catalog declares its own level via apiInfo.agentAccess.
+ */
+const AGENT_ACCESS_LEVEL_DESCRIPTIONS = {
+    full: 'Agents can discover and use this API freely.',
+    read_only: 'Agents can read docs and spec but cannot subscribe or call.',
+    human_approval: 'Subscription requires a human to approve. See approval_url in the API detail response.',
+    hidden: 'Not visible to agents.',
+};
+
+// ─── Agent discovery endpoint (global) ───────────────────────────────────────
+// Acts as a capability contract: tells agents exactly what they can do without auth,
+// what requires auth, and how to obtain credentials before making any requests.
+app.get('/.well-known/agent.json', (req, res) => {
+    const host = req.protocol + '://' + req.get('host');
+
+    res.json({
+        schema_version: '1.0',
+        name: 'API Developer Portal',
+        description: 'Discover, subscribe to, and manage API access programmatically.',
+        provider: 'WSO2',
+
+        // How agents authenticate — declared upfront so agents know before making requests.
+        authentication: buildAgentAuthSection(),
+
+        // Capability contract: agents should read this before deciding whether to authenticate.
+        // auth_required: true  → agent must authenticate before calling this
+        // auth_required: false → agent can call immediately with no credentials
+        capabilities: [
+            {
+                name: 'api_discovery',
+                description: 'List and search APIs in the org catalog.',
+                auth_required: false,
+                accept: 'application/json',
+                url_pattern: `${host}/{orgName}/views/{viewName}/apis`,
+                example: `${host}/{orgName}/views/default/apis`,
+            },
+            {
+                name: 'mcp_server_discovery',
+                description: 'List MCP servers and their available tools.',
+                auth_required: false,
+                accept: 'application/json',
+                url_pattern: `${host}/{orgName}/views/{viewName}/mcps`,
+                example: `${host}/{orgName}/views/default/mcps`,
+            },
+            {
+                name: 'api_detail',
+                description: 'Get full details of a specific API including endpoints, plans, and agent access level.',
+                auth_required: false,
+                accept: 'application/json',
+                url_pattern: `${host}/{orgName}/views/{viewName}/api/{apiHandle}`,
+            },
+            {
+                name: 'api_specification',
+                description: 'Get the raw OpenAPI / AsyncAPI / GraphQL schema for an API.',
+                auth_required: false,
+                accept: 'application/json',
+                url_pattern: `${host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification`,
+            },
+            {
+                name: 'application_management',
+                description: 'Create and manage applications. An application is required before subscribing to APIs.',
+                auth_required: true,
+                auth_schemes: ['bearer'],
+                url_pattern: `${host}/devportal/organizations/{orgId}/applications`,
+            },
+            {
+                name: 'subscription_management',
+                description: 'Subscribe an application to an API under a chosen plan.',
+                auth_required: true,
+                auth_schemes: ['bearer'],
+                url_pattern: `${host}/devportal/organizations/{orgId}/subscriptions`,
+            },
+            {
+                name: 'key_generation',
+                description: 'Generate, regenerate, or revoke API keys for an application.',
+                auth_required: true,
+                auth_schemes: ['bearer'],
+                url_pattern: `${host}/devportal/organizations/{orgId}/platform-api-keys/generate`,
+            },
+        ],
+
+        // Per-API access levels — each API in the catalog declares its own agent policy.
+        agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
+
+        // Step-by-step instructions for an agent that has only this URL and nothing else.
+        // Capabilities above use {orgName} and {viewName} placeholders — follow these steps
+        // to resolve them into concrete, callable URLs before making any requests.
+        getting_started: {
+            step_1: {
+                instruction: 'Ask the user which organisation they want to use. The org name is the short identifier in the portal URL, e.g. "acme" in devportal.example.com/acme/views/default.',
+                how_to_get_org_name: 'Ask the user.',
+            },
+            step_2: {
+                instruction: 'Once you have the org name, fetch the per-org discovery document. It returns concrete URLs with all placeholders resolved, the list of available views, and the org ID.',
+                url: `${host}/{orgName}/agent.json`,
+                example: `${host}/acme/agent.json`,
+            },
+            step_3: {
+                instruction: 'Use the URLs from the per-org document directly — no further substitution needed. Start with api_discovery (no auth required) to browse available APIs.',
+            },
+        },
+    });
+});
+
+// Per-org agent discovery — resolves {orgName} and {viewName} into concrete usable URLs.
+// An agent that knows which org it's working with should call this instead of the global one.
+// No authentication required.
+app.get('/:orgName/agent.json', async (req, res) => {
+    const { orgName } = req.params;
+    if (['favicon.ico', 'images', 'portal', 'devportal', 'styles', 'scripts'].includes(orgName)) {
+        return res.status(404).json({ error: 'not_found' });
+    }
+    try {
+        const host = req.protocol + '://' + req.get('host');
+
+        const orgDetails = await adminDao.getOrganization(orgName);
+        const orgID = orgDetails.ORG_ID;
+
+        // Fetch available views, fall back to ["default"] if none configured
+        let views = ['default'];
+        try {
+            const viewRows = await apiDao.getAllViews(orgID);
+            if (viewRows?.length > 0) {
+                views = viewRows.map(v => v.dataValues?.NAME || v.NAME).filter(Boolean);
+            }
+        } catch (_) { /* use fallback */ }
+
+        const defaultView = views[0];
+
+        res.json({
+            schema_version: '1.0',
+            org: orgName,
+            org_id: orgID,
+
+            // All views available in this org — substitute one of these for {viewName}
+            views,
+            default_view: defaultView,
+
+            authentication: buildAgentAuthSection(),
+
+            // Concrete, ready-to-call URLs — no placeholders to resolve
+            capabilities: [
+                {
+                    name: 'api_discovery',
+                    description: 'List and search APIs in this org.',
+                    auth_required: false,
+                    accept: 'application/json',
+                    urls: views.map(v => `${host}/${orgName}/views/${v}/apis`),
+                    default_url: `${host}/${orgName}/views/${defaultView}/apis`,
+                },
+                {
+                    name: 'mcp_server_discovery',
+                    description: 'List MCP servers and their tools in this org.',
+                    auth_required: false,
+                    accept: 'application/json',
+                    urls: views.map(v => `${host}/${orgName}/views/${v}/mcps`),
+                    default_url: `${host}/${orgName}/views/${defaultView}/mcps`,
+                },
+                {
+                    name: 'api_detail',
+                    description: 'Get details of a specific API. Replace {apiHandle} with a handle from api_discovery.',
+                    auth_required: false,
+                    accept: 'application/json',
+                    url_pattern: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}`,
+                },
+                {
+                    name: 'api_specification',
+                    description: 'Get the raw OpenAPI / AsyncAPI / GraphQL spec for an API.',
+                    auth_required: false,
+                    accept: 'application/json',
+                    url_pattern: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}/docs/specification`,
+                },
+                {
+                    name: 'application_management',
+                    description: 'Create and manage applications. Required before subscribing to APIs.',
+                    auth_required: true,
+                    auth_schemes: ['bearer'],
+                    url: `${host}/devportal/organizations/${orgID}/applications`,
+                },
+                {
+                    name: 'subscription_management',
+                    description: 'Subscribe an application to an API under a chosen plan.',
+                    auth_required: true,
+                    auth_schemes: ['bearer'],
+                    url: `${host}/devportal/organizations/${orgID}/subscriptions`,
+                },
+                {
+                    name: 'key_generation',
+                    description: 'Generate, regenerate, or revoke API keys.',
+                    auth_required: true,
+                    auth_schemes: ['bearer'],
+                    url: `${host}/devportal/organizations/${orgID}/platform-api-keys/generate`,
+                },
+            ],
+
+            agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
+        });
+    } catch (error) {
+        logger.error('Per-org agent.json error', { orgName, error: error.message });
+        res.status(404).json({ error: 'not_found', message: `Organization '${orgName}' not found.` });
+    }
+});
 
 //backend routes
 app.use(constants.ROUTE.DEV_PORTAL, devportalRoute);
