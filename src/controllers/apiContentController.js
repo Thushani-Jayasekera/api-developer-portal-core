@@ -33,7 +33,7 @@ const adminService = require('../services/adminService');
 const subscriptionPolicyDTO = require('../dto/subscriptionPolicy');
 const { ApplicationDTO } = require('../dto/application');
 const APIDTO = require('../dto/apiDTO');
-const { toAgentApiListResponse, toAgentApiDetail, toAgentMCPDetail, isHiddenFromAgents } = require('../dto/agentApiDTO');
+const { toAgentApiListResponse, toAgentApiDetail, toAgentMCPDetail, isHiddenFromAgents, resolveAgentAccess, AGENT_ACCESS_LEVELS } = require('../dto/agentApiDTO');
 const { buildSchema, getIntrospectionQuery, graphql: executeGraphQL } = require('graphql');
 const { log } = require('console');
 const controlPlaneUrl = config.controlPlane.url;
@@ -185,7 +185,8 @@ const loadAPIs = async (req, res) => {
             if (req.wantsJSON) {
                 const isMCPView = req.originalUrl.includes('/mcps');
                 const baseUrl = '/' + orgName + constants.ROUTE.VIEWS_PATH + viewName;
-                return res.json(toAgentApiListResponse(metaDataList, baseUrl, isMCPView));
+                const host = req.protocol + '://' + req.get('host');
+                return res.json(toAgentApiListResponse(metaDataList, baseUrl, isMCPView, host));
             }
 
             if (req.originalUrl.includes("/mcps")) {
@@ -475,10 +476,11 @@ const loadAPIContent = async (req, res) => {
                     return res.status(404).json({ error: 'not_found', message: 'API not found.' });
                 }
                 const baseUrl = '/' + orgName + constants.ROUTE.VIEWS_PATH + viewName;
+                const host = req.protocol + '://' + req.get('host');
                 if (metaData.apiInfo.apiType === 'MCP') {
-                    return res.json(toAgentMCPDetail(metaData, schemaDefinition, baseUrl));
+                    return res.json(toAgentMCPDetail(metaData, schemaDefinition, baseUrl, host));
                 }
-                return res.json(toAgentApiDetail(metaData, apiDetail?.scopes, baseUrl));
+                return res.json(toAgentApiDetail(metaData, apiDetail?.scopes, baseUrl, host));
             }
 
             if (metaData.apiInfo.apiType == "MCP") {
@@ -766,6 +768,18 @@ const loadDocument = async (req, res) => {
 
             // Agent JSON fork: return raw spec instead of HTML
             if (req.wantsJSON) {
+                const agentAccess = resolveAgentAccess(apiMetadata);
+                if (agentAccess.level === AGENT_ACCESS_LEVELS.HIDDEN) {
+                    return res.status(404).json({ error: 'not_found', message: 'API not found.' });
+                }
+                if (agentAccess.level === AGENT_ACCESS_LEVELS.READ_ONLY) {
+                    return res.status(403).json({
+                        error: 'access_restricted',
+                        level: 'read_only',
+                        message: 'Agents cannot access the specification for this API.',
+                        reason: agentAccess.reason || null,
+                    });
+                }
                 if (templateContent.swagger) {
                     return res.json(JSON.parse(templateContent.swagger));
                 }

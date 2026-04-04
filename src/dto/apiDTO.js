@@ -59,6 +59,7 @@ class APIInfo {
         this.gatewayVendor = apiInfo.METADATA_SEARCH?.apiInfo?.gatewayVendor || 'wso2';
         this.tokenBasedSubscriptionEnabled = apiInfo.TOKEN_BASED_SUBSCRIPTION_ENABLED || false;
         this.gatewayType = apiInfo.GATEWAY_TYPE || null;
+        this.agentAccess = apiInfo.METADATA_SEARCH?.apiInfo?.agentAccess || null;
         if (apiInfo.addedLabels) {
             this.addedLabels = apiInfo.addedLabels;
         }

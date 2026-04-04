@@ -30,6 +30,7 @@ const logger = require('./config/logger');
 const { auditMiddleware } = require('./middlewares/auditLogger');
 const agentNegotiation = require('./middlewares/agentNegotiation');
 const agentActivityLogger = require('./middlewares/agentActivityLogger');
+const { AGENT_ACCESS_LEVEL_DESCRIPTIONS } = require('./dto/agentApiDTO');
 const adminDao = require('./dao/admin');
 const apiDao = require('./dao/apiMetadata');
 const authRoute = require('./routes/authRoute');
@@ -367,6 +368,15 @@ app.use(agentNegotiation);
 // Thresholds can be tuned via config.agentMonitoring in config.json.
 app.use(agentActivityLogger);
 
+// Agent discoverability — advertise the agent manifest on every response so that any
+// agent landing on any URL can find the discovery document without prior knowledge.
+// Analogous to <link rel="canonical"> in SEO: passive, zero-cost, always present.
+app.use((req, res, next) => {
+    const host = req.protocol + '://' + req.get('host');
+    res.set('Link', `<${host}/.well-known/llms.txt>; rel="agent-manifest"`);
+    next();
+});
+
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -587,114 +597,82 @@ function buildAgentAuthSection() {
     };
 }
 
-/**
- * Access-level descriptions shared by both agent discovery endpoints.
- * Each API in the catalog declares its own level via apiInfo.agentAccess.
- */
-const AGENT_ACCESS_LEVEL_DESCRIPTIONS = {
-    full: 'Agents can discover and use this API freely.',
-    read_only: 'Agents can read docs and spec but cannot subscribe or call.',
-    human_approval: 'Subscription requires a human to approve. See approval_url in the API detail response.',
-    hidden: 'Not visible to agents.',
+
+// ─── llms.txt — entry point for LLM/agent crawlers ──────────────────────────
+// Served at both the well-known path and the root (both conventions are in use).
+// This is the single entry point for agents — replaces a separate global agent.json.
+// Agents read this to understand the portal, find the org name, and get to the
+// per-org manifest which has concrete URLs and the full integration guide.
+const llmsTxt = (req, res) => {
+    const host = req.protocol + '://' + req.get('host');
+    res.type('text/plain').send(`# API Developer Portal
+
+> A developer portal for discovering, subscribing to, and integrating with APIs programmatically.
+> Agents can browse the full API catalog, fetch OpenAPI/AsyncAPI specifications, and manage
+> subscriptions without scraping HTML — use Accept: application/json on any portal URL.
+
+## Getting Started
+
+The portal is organised by organisation (org). Each org has its own API catalog.
+To get started, you need to know the org name — then fetch its discovery document.
+
+### Step 1 — Find the org name
+
+If the user mentioned an org name explicitly (e.g. "use the acme org") or gave you a
+portal URL (e.g. ${host}/acme/views/default/apis), extract the org name from that.
+The org name is the first path segment after the portal host.
+Only ask the user for the org name if it is genuinely unknown from context.
+
+### Step 2 — Fetch the per-org discovery document
+
+  ${host}/{orgName}/agent.json
+  (replace {orgName} with the org name you found in step 1)
+
+This returns:
+- Concrete, ready-to-call URLs for all capabilities (no further substitution needed)
+- A full integration_guide walking through discovery → access check → subscribe → keys → integrate
+
+## API Catalog
+
+List all APIs for an organisation (JSON):
+  ${host}/{orgName}/views/{viewName}/apis
+  ${host}/{orgName}/views/{viewName}/apis?query=payment   (keyword search)
+  Accept: application/json
+
+Get a single API with agent access level, endpoints, and subscription plans (JSON):
+  ${host}/{orgName}/views/{viewName}/api/{apiHandle}
+  Accept: application/json
+
+Fetch raw OpenAPI / AsyncAPI / GraphQL spec (JSON):
+  ${host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification
+  Accept: application/json
+
+## MCP Servers
+
+List available MCP servers (JSON):
+  ${host}/{orgName}/views/{viewName}/mcps
+  Accept: application/json
+
+## Agent Access Levels
+
+Each API declares an agent_access level in its JSON response:
+  full            — agent can discover, read, subscribe, and invoke freely
+  read_only       — agent can discover and read documentation; subscription and invocation blocked
+  human_approval  — agent must pause and get explicit consent from its human operator before proceeding
+  hidden          — not visible to agents at all
+
+## Authentication
+
+Some capabilities require a bearer token. The per-org discovery document (step 2 above)
+includes the full authentication section explaining how to obtain credentials.
+`);
 };
 
-// ─── Agent discovery endpoint (global) ───────────────────────────────────────
-// Acts as a capability contract: tells agents exactly what they can do without auth,
-// what requires auth, and how to obtain credentials before making any requests.
-app.get('/.well-known/agent.json', (req, res) => {
-    const host = req.protocol + '://' + req.get('host');
-
-    res.json({
-        schema_version: '1.0',
-        name: 'API Developer Portal',
-        description: 'Discover, subscribe to, and manage API access programmatically.',
-        provider: 'WSO2',
-
-        // How agents authenticate — declared upfront so agents know before making requests.
-        authentication: buildAgentAuthSection(),
-
-        // Capability contract: agents should read this before deciding whether to authenticate.
-        // auth_required: true  → agent must authenticate before calling this
-        // auth_required: false → agent can call immediately with no credentials
-        capabilities: [
-            {
-                name: 'api_discovery',
-                description: 'List and search APIs in the org catalog.',
-                auth_required: false,
-                accept: 'application/json',
-                url_pattern: `${host}/{orgName}/views/{viewName}/apis`,
-                example: `${host}/{orgName}/views/default/apis`,
-            },
-            {
-                name: 'mcp_server_discovery',
-                description: 'List MCP servers and their available tools.',
-                auth_required: false,
-                accept: 'application/json',
-                url_pattern: `${host}/{orgName}/views/{viewName}/mcps`,
-                example: `${host}/{orgName}/views/default/mcps`,
-            },
-            {
-                name: 'api_detail',
-                description: 'Get full details of a specific API including endpoints, plans, and agent access level.',
-                auth_required: false,
-                accept: 'application/json',
-                url_pattern: `${host}/{orgName}/views/{viewName}/api/{apiHandle}`,
-            },
-            {
-                name: 'api_specification',
-                description: 'Get the raw OpenAPI / AsyncAPI / GraphQL schema for an API.',
-                auth_required: false,
-                accept: 'application/json',
-                url_pattern: `${host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification`,
-            },
-            {
-                name: 'application_management',
-                description: 'Create and manage applications. An application is required before subscribing to APIs.',
-                auth_required: true,
-                auth_schemes: ['bearer'],
-                url_pattern: `${host}/devportal/organizations/{orgId}/applications`,
-            },
-            {
-                name: 'subscription_management',
-                description: 'Subscribe an application to an API under a chosen plan.',
-                auth_required: true,
-                auth_schemes: ['bearer'],
-                url_pattern: `${host}/devportal/organizations/{orgId}/subscriptions`,
-            },
-            {
-                name: 'key_generation',
-                description: 'Generate, regenerate, or revoke API keys for an application.',
-                auth_required: true,
-                auth_schemes: ['bearer'],
-                url_pattern: `${host}/devportal/organizations/{orgId}/platform-api-keys/generate`,
-            },
-        ],
-
-        // Per-API access levels — each API in the catalog declares its own agent policy.
-        agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
-
-        // Step-by-step instructions for an agent that has only this URL and nothing else.
-        // Capabilities above use {orgName} and {viewName} placeholders — follow these steps
-        // to resolve them into concrete, callable URLs before making any requests.
-        getting_started: {
-            step_1: {
-                instruction: 'Ask the user which organisation they want to use. The org name is the short identifier in the portal URL, e.g. "acme" in devportal.example.com/acme/views/default.',
-                how_to_get_org_name: 'Ask the user.',
-            },
-            step_2: {
-                instruction: 'Once you have the org name, fetch the per-org discovery document. It returns concrete URLs with all placeholders resolved, the list of available views, and the org ID.',
-                url: `${host}/{orgName}/agent.json`,
-                example: `${host}/acme/agent.json`,
-            },
-            step_3: {
-                instruction: 'Use the URLs from the per-org document directly — no further substitution needed. Start with api_discovery (no auth required) to browse available APIs.',
-            },
-        },
-    });
-});
+app.get('/llms.txt', llmsTxt);
+app.get('/.well-known/llms.txt', llmsTxt);
 
 // Per-org agent discovery — resolves {orgName} and {viewName} into concrete usable URLs.
-// An agent that knows which org it's working with should call this instead of the global one.
+// Entry point for agents: read llms.txt first to find the org name, then call this.
 // No authentication required.
 app.get('/:orgName/agent.json', async (req, res) => {
     const { orgName } = req.params;
@@ -738,6 +716,10 @@ app.get('/:orgName/agent.json', async (req, res) => {
                     accept: 'application/json',
                     urls: views.map(v => `${host}/${orgName}/views/${v}/apis`),
                     default_url: `${host}/${orgName}/views/${defaultView}/apis`,
+                    query_params: {
+                        query: 'Keyword search across API names, descriptions, and tags. Example: ?query=payment',
+                        tags: 'Filter by tag. Example: ?tags=finance',
+                    },
                 },
                 {
                     name: 'mcp_server_discovery',
@@ -785,6 +767,194 @@ app.get('/:orgName/agent.json', async (req, res) => {
             ],
 
             agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
+
+            // Step-by-step integration guide for agents tasked with "find an API and build an integration".
+            // All URLs in this section are ready to call — no placeholders to resolve.
+            integration_guide: {
+                overview: 'Follow these steps in order to find an API and integrate it into your software.',
+                steps: [
+                    {
+                        step: 1,
+                        action: 'discover',
+                        instruction: 'Fetch the API catalog. Use ?query= to search by keyword rather than loading everything.',
+                        url: `${host}/${orgName}/views/${defaultView}/apis`,
+                        example: `${host}/${orgName}/views/${defaultView}/apis?query=payment`,
+                        accept: 'application/json',
+                    },
+                    {
+                        step: 2,
+                        action: 'check_access',
+                        instruction: 'Before going further with any API, read its agent_access.level. This determines whether you can proceed autonomously.',
+                        rules: {
+                            full: 'Proceed autonomously.',
+                            read_only: 'You can read the spec but cannot subscribe or call this API. Pick a different one.',
+                            human_approval: 'STOP. Tell your human operator which API you found and why you want to use it. Do not subscribe or invoke until they confirm.',
+                            hidden: 'This API will not appear in results — no action needed.',
+                        },
+                    },
+                    {
+                        step: 3,
+                        action: 'evaluate_and_plan',
+                        instruction: 'Fetch the API detail and its spec. Read the spec thoroughly — understand the endpoints, required inputs, response shapes, and authentication scheme before committing to a subscription. Use this step to plan your integration: which endpoints you will call, in what order, and with what payloads. Do not subscribe until you are confident this API meets your needs.',
+                        api_detail_url: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}`,
+                        api_spec_url: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}/docs/specification`,
+                        accept: 'application/json',
+                    },
+                    {
+                        step: 4,
+                        action: 'authenticate',
+                        instruction: 'Subscribing and generating keys requires a bearer token. Check whether you already have one from the user. If not, ask the user to provide their portal bearer token before proceeding — do not attempt steps 5 or 6 without it.',
+                        auth_required: true,
+                        token_source: 'Ask the user. The token is a user-scoped bearer token for this portal, not an API key.',
+                        how_to_use: 'Include it as: Authorization: Bearer <token>',
+                    },
+                    {
+                        step: 5,
+                        action: 'subscribe',
+                        condition: 'Check subscription_required in the API detail response from step 3. If false (gateway_vendor is "wso2/api-platform"), skip this step entirely and go to step 6.',
+                        instruction: 'Create an application, then subscribe it to the API under a plan listed in the API detail response.',
+                        auth_required: true,
+                        create_application_url: `${host}/devportal/organizations/${orgID}/applications`,
+                        subscribe_url: `${host}/devportal/organizations/${orgID}/subscriptions`,
+                        note: 'If an application already exists for this user, reuse it — check for a 409 conflict and list existing applications instead of creating a new one.',
+                    },
+                    {
+                        step: 6,
+                        action: 'generate_credentials',
+                        instruction: 'How you generate credentials depends on two things: the gateway_vendor from step 3 and the securitySchemes in the API spec from step 3. Follow the matching path below.',
+                        auth_required: true,
+                        by_gateway: {
+                            'wso2/api-platform': {
+                                instruction: 'This gateway does not require a subscription. Generate a platform API key directly.',
+                                url: `${host}/devportal/organizations/${orgID}/platform-api-keys/generate`,
+                                credential_type: 'api_key',
+                                usage: 'Pass the returned key in the header specified in the spec\'s securitySchemes.',
+                            },
+                            other: {
+                                instruction: 'Read the securitySchemes from the spec fetched in step 3 and follow the matching path.',
+                                by_security_scheme: {
+                                    api_key: {
+                                        instruction: 'Generate an API key for your subscribed application.',
+                                        url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/api-keys/generate`,
+                                        credential_type: 'api_key',
+                                        usage: 'Pass the returned key in the header specified in the spec\'s securitySchemes (typically an apiKey header).',
+                                    },
+                                    oauth2: {
+                                        instruction: 'Generate OAuth2 client credentials for your subscribed application, then use them to obtain an access token.',
+                                        step_a: {
+                                            action: 'generate_client_credentials',
+                                            instruction: 'Generate OAuth2 keys for your application. The response contains client_id, client_secret, and keyMappingId.',
+                                            url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/generate-keys`,
+                                        },
+                                        step_b: {
+                                            action: 'generate_access_token',
+                                            instruction: 'Use the client_id and client_secret from step_a to request an access token from the token endpoint declared in the spec\'s OAuth2 flow.',
+                                            url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/oauth-keys/{keyMappingId}/generate-token`,
+                                            token_request: 'POST to the token URL with grant_type=client_credentials. Include client_id and client_secret as a base64-encoded Basic auth header or as form fields, depending on the spec.',
+                                        },
+                                        credential_type: 'bearer_token',
+                                        usage: 'Pass the access token as: Authorization: Bearer <access_token>',
+                                        token_expiry: 'Access tokens expire. Re-request a token using the same client credentials when you receive a 401 response.',
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        step: 7,
+                        action: 'integrate',
+                        instruction: 'You now have everything: the API spec from step 3 and credentials from step 6. Implement the integration using the spec as your reference. Use the API credential — not the portal bearer token from step 4 — for all API calls.',
+                    },
+                ],
+            },
+
+            // What each error response means in this portal's context and what to do next.
+            // Agents should consult this before retrying, escalating, or giving up.
+            common_errors: {
+                overview: 'All error responses include an "error" field (machine-readable code) and a "message" field (human-readable detail). Use the "error" field for programmatic handling.',
+                errors: [
+                    {
+                        status: 400,
+                        error_code: 'bad_request',
+                        meaning: 'The request body is malformed or missing required fields.',
+                        common_causes: [
+                            'Missing required field when creating an application or subscription.',
+                            'Invalid JSON body.',
+                            'Uploading a file in an unsupported format.',
+                        ],
+                        resolution: 'Read the "message" field for which field is missing or invalid. Correct the request body and retry. Do not retry without fixing the payload.',
+                    },
+                    {
+                        status: 401,
+                        error_code: 'unauthorized',
+                        meaning: 'No credentials were provided or the bearer token has expired.',
+                        common_causes: [
+                            'Calling a protected endpoint (application, subscription, key management) without a bearer token.',
+                            'Token has expired mid-session.',
+                        ],
+                        resolution: 'Re-authenticate using the auth flow described in the "authentication" section of this document. Obtain a fresh token and retry the request.',
+                    },
+                    {
+                        status: 403,
+                        error_code: 'access_restricted',
+                        meaning: 'The request was understood but the caller is not permitted to perform this action.',
+                        common_causes: [
+                            'Fetching the spec of a read_only API — agents are not entitled to the spec for read_only APIs.',
+                            'Fetching any resource belonging to a hidden API.',
+                            'Authenticated user does not have sufficient portal permissions for the requested operation.',
+                        ],
+                        resolution: 'Check the "level" field in the error body. If "read_only" or "hidden", pick a different API with agent_access.level of "full" or "human_approval". For permission errors, do not retry — escalate to the human operator.',
+                    },
+                    {
+                        status: 404,
+                        error_code: 'not_found',
+                        meaning: 'The requested resource does not exist or is intentionally not visible to agents.',
+                        common_causes: [
+                            'Incorrect apiHandle — double-check the handle from the api_discovery response.',
+                            'The API has agent_access.level of "hidden" — these are filtered out and return 404 to agents.',
+                            'The organization name is wrong.',
+                        ],
+                        resolution: 'Verify the handle by re-fetching the api_discovery list. Do not guess or iterate through handles. If the org returns 404, confirm the org name with the user.',
+                    },
+                    {
+                        status: 409,
+                        error_code: 'conflict',
+                        meaning: 'The resource you are trying to create already exists.',
+                        common_causes: [
+                            'Creating an application with a name that already exists for this user.',
+                            'Subscribing an application to an API it is already subscribed to.',
+                        ],
+                        resolution: 'List existing applications or subscriptions first. If the resource already exists, reuse it rather than creating a new one.',
+                    },
+                    {
+                        status: 429,
+                        error_code: 'rate_limited',
+                        meaning: 'The agent is making requests too fast. The portal has detected abnormal request patterns.',
+                        common_causes: [
+                            'More than 60 requests per minute from the same agent.',
+                            'More than 500 requests per hour.',
+                            'Iterating through more than 20 distinct API handles in under 5 minutes (detected as scanning).',
+                            'More than 5 consecutive 404 responses (detected as probing).',
+                        ],
+                        resolution: 'Back off immediately. Wait at least 60 seconds before retrying. Use ?query= to search for specific APIs rather than iterating through the catalog. If the task genuinely requires broad catalog access, inform the human operator.',
+                    },
+                    {
+                        status: 500,
+                        error_code: 'internal_error',
+                        meaning: 'An unexpected error occurred on the portal server.',
+                        resolution: 'Retry once after a short delay (5–10 seconds). If the error persists, do not keep retrying — inform the human operator that the portal is experiencing an issue.',
+                    },
+                    {
+                        status: 'timeout',
+                        meaning: 'The portal did not respond within the expected window.',
+                        common_causes: [
+                            'Fetching a large API specification.',
+                            'Transient portal load spike.',
+                        ],
+                        resolution: 'Retry once with a longer timeout. If it times out again, inform the human operator rather than retrying in a loop.',
+                    },
+                ],
+            },
         });
     } catch (error) {
         logger.error('Per-org agent.json error', { orgName, error: error.message });
