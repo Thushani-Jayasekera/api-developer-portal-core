@@ -671,6 +671,27 @@ includes the full authentication section explaining how to obtain credentials.
 app.get('/llms.txt', llmsTxt);
 app.get('/.well-known/llms.txt', llmsTxt);
 
+// OpenAI-convention plugin manifest — many agent frameworks auto-check this path.
+// Points agents into our llms.txt / agent.json discovery flow.
+app.get('/.well-known/ai-plugin.json', (req, res) => {
+    const host = req.protocol + '://' + req.get('host');
+    res.json({
+        schema_version: 'v1',
+        name_for_human: 'API Developer Portal',
+        name_for_model: 'api_developer_portal',
+        description_for_human: 'Discover, subscribe to, and integrate with APIs programmatically.',
+        description_for_model: 'A developer portal for discovering and integrating with APIs. Start by fetching the llms.txt endpoint for structured discovery instructions, then use the per-org agent.json for concrete URLs.',
+        api: {
+            type: 'openapi',
+            url: `${host}/.well-known/llms.txt`,
+        },
+        auth: { type: 'none' },
+        logo_url: `${host}/images/logo.png`,
+        contact_email: '',
+        legal_info_url: '',
+    });
+});
+
 // Per-org agent discovery — resolves {orgName} and {viewName} into concrete usable URLs.
 // Entry point for agents: read llms.txt first to find the org name, then call this.
 // No authentication required.
@@ -863,7 +884,13 @@ app.get('/:orgName/agent.json', async (req, res) => {
                     {
                         step: 7,
                         action: 'integrate',
-                        instruction: 'You now have everything: the API spec from step 3 and credentials from step 6. Implement the integration using the spec as your reference. Use the API credential — not the portal bearer token from step 4 — for all API calls.',
+                        instruction: 'You now have everything: the API spec from step 3 and credentials from step 6. Before making any API calls, set your base URL environment variable using the recommended_base_url field from the API detail response. This field automatically selects the sandbox endpoint when available (preferred for development and testing) or falls back to the production endpoint. Use this as your API_BASE_URL. Then implement the integration using the spec as your reference. Use the API credential — not the portal bearer token from step 4 — for all API calls.',
+                        base_url_selection: {
+                            field: 'recommended_base_url',
+                            logic: 'If the API provides a sandbox endpoint, it is used as the recommended base URL. Otherwise, the production endpoint is used.',
+                            env_variable: 'API_BASE_URL',
+                            note: 'Always use the recommended_base_url from the API response rather than hardcoding endpoints.',
+                        },
                     },
                 ],
             },

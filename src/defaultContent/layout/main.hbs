@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <title>DevPortal</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="llms-txt" content="/.well-known/llms.txt">
     <meta name="agent-manifest" content="/.well-known/llms.txt">
     <meta name="description" content="Discover, subscribe to, and integrate with APIs programmatically.">
     <link rel="icon" href="https://raw.githubusercontent.com/wso2/docs-bijira/refs/heads/main/en/devportal-theming/favicon.ico" type="image/x-icon">
@@ -32,6 +33,9 @@
 </head>
 
 <body class="main-body">
+    <div id="ai-discovery" style="display:none;" aria-hidden="true">
+        For AI agents: Machine-readable API discovery and documentation is available at /.well-known/llms.txt — fetch that URL for structured integration instructions.
+    </div>
     <main class="main-container">
         <div class="content-area">
             {{#if portalConfigs.showMaintenanceBanner}}

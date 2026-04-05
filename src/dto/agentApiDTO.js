@@ -103,6 +103,8 @@ const toAgentApiSummary = (apiMetadata, baseUrl) => {
             if (apiMetadata.endPoints?.sandboxURL) {
                 summary.endpoints.sandbox = apiMetadata.endPoints.sandboxURL;
             }
+            // Prefer sandbox for development/testing; fall back to production
+            summary.recommended_base_url = apiMetadata.endPoints.sandboxURL || apiMetadata.endPoints.productionURL;
         }
 
         if (agentAccess.level !== AGENT_ACCESS_LEVELS.READ_ONLY) {
@@ -151,6 +153,8 @@ const toAgentApiDetail = (apiMetadata, scopes, baseUrl, host) => {
         if (apiMetadata.endPoints.sandboxURL) {
             detail.endpoints.sandbox = apiMetadata.endPoints.sandboxURL;
         }
+        // Prefer sandbox for development/testing; fall back to production
+        detail.recommended_base_url = apiMetadata.endPoints.sandboxURL || apiMetadata.endPoints.productionURL;
     }
 
     if (scopes?.length > 0) {
