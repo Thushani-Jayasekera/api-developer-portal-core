@@ -105,9 +105,7 @@ const toAgentApiSummary = (apiMetadata, baseUrl) => {
             summary.recommended_base_url = apiMetadata.endPoints.sandboxURL || apiMetadata.endPoints.productionURL;
         }
 
-        if (agentAccess.level !== AGENT_ACCESS_LEVELS.READ_ONLY) {
-            summary.links.specification = `${baseUrl}/${apiPathSegment}/${handle}/docs/specification`;
-        }
+        summary.links.specification = `${baseUrl}/${apiPathSegment}/${handle}/docs/specification`;
 
         if (apiMetadata.subscriptionPolicyDetails?.length > 0) {
             summary.subscription_plans = apiMetadata.subscriptionPolicyDetails.map(toAgentSubscriptionPlan);

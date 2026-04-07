@@ -588,14 +588,6 @@ const loadWorkflow = async (req, res) => {
             if (agentAccess.level === AGENT_ACCESS_LEVELS.HIDDEN) {
                 return res.status(404).json({ error: 'not_found', message: 'API not found.' });
             }
-            if (agentAccess.level === AGENT_ACCESS_LEVELS.READ_ONLY) {
-                return res.status(403).json({
-                    error: 'access_restricted',
-                    level: 'read_only',
-                    message: 'Agents cannot access the API usage workflow for this API.',
-                    reason: agentAccess.reason || null,
-                });
-            }
         }
 
         const workflowFile = await apiDao.getAPIFile(
@@ -877,14 +869,6 @@ const loadDocument = async (req, res) => {
                 const agentAccess = resolveAgentAccess(apiMetadata);
                 if (agentAccess.level === AGENT_ACCESS_LEVELS.HIDDEN) {
                     return res.status(404).json({ error: 'not_found', message: 'API not found.' });
-                }
-                if (agentAccess.level === AGENT_ACCESS_LEVELS.READ_ONLY) {
-                    return res.status(403).json({
-                        error: 'access_restricted',
-                        level: 'read_only',
-                        message: 'Agents cannot access the specification for this API.',
-                        reason: agentAccess.reason || null,
-                    });
                 }
                 // Build the agent response with raw spec
                 const agentResponse = {};

@@ -848,11 +848,10 @@ app.get('/:orgName/agent.json', async (req, res) => {
                         error_code: 'access_restricted',
                         meaning: 'The request was understood but the caller is not permitted to perform this action.',
                         common_causes: [
-                            'Fetching the spec of a read_only API — agents are not entitled to the spec for read_only APIs.',
                             'Fetching any resource belonging to a hidden API.',
                             'Authenticated user does not have sufficient portal permissions for the requested operation.',
                         ],
-                        resolution: 'Check the "level" field in the error body. If "read_only" or "hidden", pick a different API with agent_access.level of "full" or "human_approval". For permission errors, do not retry — escalate to the human operator.',
+                        resolution: 'Check the "level" field in the error body. If "hidden", pick a different API with agent_access.level of "full" or "human_approval". For permission errors, do not retry — escalate to the human operator.',
                     },
                     {
                         status: 404,

@@ -108,11 +108,9 @@
               {{#if apiInfo.agentAccess}}
               <div class="agent-access-badge
                 {{#if (eq apiInfo.agentAccess.level 'full')}}agent-access-full
-                {{else if (eq apiInfo.agentAccess.level 'read_only')}}agent-access-read-only
                 {{else if (eq apiInfo.agentAccess.level 'human_approval')}}agent-access-approval
                 {{/if}}">
                 {{#if (eq apiInfo.agentAccess.level 'full')}}AI Agent Ready
-                {{else if (eq apiInfo.agentAccess.level 'read_only')}}Agent: Read Only
                 {{else if (eq apiInfo.agentAccess.level 'human_approval')}}Human in the Loop
                 {{/if}}
               </div>
