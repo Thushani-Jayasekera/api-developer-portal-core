@@ -1,0 +1,385 @@
+arazzo: 1.0.0
+
+info:
+  title: Generate WSO2 Platform API Key
+  summary: Generate an API key for a wso2/api-platform API with optional subscription
+  description: |
+    Targeted key-generation workflow for APIs on the wso2/api-platform gateway.
+
+    ## When to use
+    Only when gateway_vendor == "wso2/api-platform" and securitySchemes contains apiKey.
+
+    ## Pre-requisites
+    The agent MUST have already:
+      1. Discovered the API (via discover-api workflow).
+      2. Built the integration code using the API spec with placeholder credentials.
+    Do NOT invoke this workflow until the integration code is written.
+
+    ## Flow
+      1. Verify the api_key security scheme is present — stop if not.
+      2. Ask the human operator whether a subscription is required.
+      3a. No subscription → generate a platform API key directly.
+      3b. Subscription required → create app → subscribe → generate app-scoped key.
+
+    ## Key naming convention
+      "agent-<apiHandle>-<keyType>"   e.g. "agent-weather-api-SANDBOX"
+
+  version: 1.0.0
+
+workflows:
+
+  - workflowId: generate-wso2-platform-api-key
+    summary: Generate an API key for a wso2/api-platform API with optional subscription
+    description: |
+      Targeted key-generation workflow for APIs on the wso2/api-platform gateway.
+
+      ## Pre-conditions (caller must verify before invoking)
+        - gateway_vendor == "wso2/api-platform"
+        - securitySchemes (fetched from the API) contains an apiKey entry
+        - Integration code is ALREADY BUILT using the API spec
+
+      ## Flow
+        1. Verify the api_key security scheme is present — stop if not.
+        2. Ask the human operator whether a subscription is required.
+           (Pass subscriptionRequired: true/false to skip this gate when already known.)
+        3a. No subscription → generate a platform API key directly.
+            The key is named "agent-<apiHandle>-<keyType>" to indicate it was
+            agent-generated, and carries the requested expiry time.
+        3b. Subscription required → create an application → subscribe to the API
+            → generate an application-scoped API key with the same naming convention.
+
+      ## Key naming convention
+        "agent-<apiHandle>-<keyType>"   e.g. "agent-weather-api-SANDBOX"
+        This makes agent-generated keys identifiable in the portal key list.
+
+      ## Expiry
+        Pass expirySeconds in inputs. Defaults to 3600 (1 hour) for SANDBOX and
+        86400 (24 hours) for PRODUCTION when not set.
+    x-agent-access:
+      level: full
+
+    inputs:
+      type: object
+      required:
+        - orgName
+        - bearerToken
+        - apiId
+        - apiHandle
+        - apiName
+        - securitySchemes
+      properties:
+        orgName:
+          type: string
+          description: Organisation name — first path segment of any portal URL.
+        bearerToken:
+          type: string
+          description: User-scoped portal bearer token.
+        apiId:
+          type: string
+          description: >
+            ID of the target API. Available from discover-api workflow outputs.
+        apiHandle:
+          type: string
+          description: >
+            URL-safe handle of the target API. Used to construct the key name.
+        apiName:
+          type: string
+          description: Display name of the API. Used in the key description.
+        securitySchemes:
+          type: object
+          description: >
+            securitySchemes object already fetched from the API (available as
+            discover-api workflow output: securitySchemes).
+            Must contain an apiKey entry for this workflow to proceed.
+        keyType:
+          type: string
+          enum: [PRODUCTION, SANDBOX]
+          description: Whether to generate a production or sandbox key.
+          default: SANDBOX
+        expirySeconds:
+          type: integer
+          description: >
+            Key validity in seconds. Defaults to 3600 for SANDBOX, 86400 for PRODUCTION.
+            Pass -1 for no expiry (use with caution in production).
+        subscriptionRequired:
+          type: boolean
+          description: >
+            Whether a subscription is required before generating the key.
+            When omitted, the agent pauses and asks the human operator.
+            Pass true to proceed with app creation and subscription.
+            Pass false to generate a platform API key directly (no app, no subscription).
+        subscriptionPlan:
+          type: string
+          description: >
+            Subscription plan name to use when subscriptionRequired is true.
+            If omitted, the first available plan is used.
+        applicationName:
+          type: string
+          description: >
+            Name for the application to create when subscriptionRequired is true.
+            Defaults to "agent-<apiHandle>-app".
+
+    steps:
+
+      # ─── Step 1: Verify API Key Security Scheme ──────────────────────────────
+      - stepId: verify-api-key-scheme
+        description: >
+          Check that the fetched API's securitySchemes (passed as input from the
+          discover-api workflow) contains an apiKey entry.
+          This workflow only applies to api_key secured APIs — stop if not present
+          and inform the caller to use the oauth2 path instead.
+        x-no-operation: true
+        successCriteria:
+          - condition: "'apiKey' in $inputs.securitySchemes"
+        onSuccess:
+          - name: proceed-to-subscription-gate
+            type: goto
+            stepId: confirm-subscription-required
+        onFailure:
+          - name: wrong-security-scheme
+            type: end
+            description: >
+              No apiKey security scheme found in this API's spec.
+              This workflow only handles api_key secured APIs.
+              For OAuth2 APIs use the generate-oauth2-credentials workflow.
+
+      # ─── Step 2: Confirm Whether Subscription Is Required ───────────────────
+      - stepId: confirm-subscription-required
+        description: >
+          Ask the human operator whether a subscription (application + plan) is
+          required before generating the key.
+
+          Decision logic:
+            - subscriptionRequired: false → skip to platform key generation directly.
+            - subscriptionRequired: true  → skip to application creation.
+            - subscriptionRequired omitted → PAUSE and ask the operator:
+                "Does this API require a subscription before generating an API key?
+                 [yes / no]"
+              If yes, re-run with subscriptionRequired: true.
+              If no, re-run with subscriptionRequired: false.
+
+          For wso2/api-platform APIs, subscriptions are often NOT required —
+          the platform key endpoint generates keys independently of any application.
+        x-no-operation: true
+        x-agent-access:
+          level: human_approval
+          reason: >
+            Whether a subscription is needed affects billing and the key generation
+            path. The agent cannot determine this from the spec alone — the operator
+            must decide.
+        onSuccess:
+          - name: no-subscription-generate-direct
+            type: goto
+            stepId: generate-platform-api-key
+            criteria:
+              - condition: $inputs.subscriptionRequired == false
+          - name: subscription-needed-create-app
+            type: goto
+            stepId: create-application
+            criteria:
+              - condition: $inputs.subscriptionRequired == true
+          - name: ask-operator
+            type: end
+            criteria:
+              - condition: $inputs.subscriptionRequired == null
+            description: >
+              Pause here. Ask the operator: "Does this API require a subscription
+              before generating an API key? [yes / no]"
+              Then re-run with subscriptionRequired: true or false.
+
+      # ─── Step 3a: Generate Platform API Key (no subscription) ────────────────
+      - stepId: generate-platform-api-key
+        description: >
+          Generate a platform API key directly — no application or subscription needed.
+          Key name follows the convention "agent-<apiHandle>-<keyType>" so it is
+          identifiable as agent-generated in the portal key list.
+          Expiry is set from expirySeconds input (default: 3600s for SANDBOX,
+          86400s for PRODUCTION).
+        x-mcp-equivalent:
+          tool: generate_api_key
+          input: '{ "apiId": "<apiId>", "name": "agent-<apiHandle>-<keyType>", "keyType": "<keyType>", "validityPeriod": <expirySeconds> }'
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/platform-api-keys/generate"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            apiId: $inputs.apiId
+            name: "agent-{$inputs.apiHandle}-{$inputs.keyType}"
+            description: "Agent-generated key for {$inputs.apiName}. Created automatically — do not share."
+            keyType: $inputs.keyType
+            validityPeriod: $inputs.expirySeconds != null ? $inputs.expirySeconds : ($inputs.keyType == 'PRODUCTION' ? 86400 : 3600)
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          apiKey: $response.body.apiKey
+          keyId: $response.body.id
+          keyName: $response.body.name
+          expiresAt: $response.body.expiresAt
+        onSuccess:
+          - name: key-ready
+            type: goto
+            stepId: key-ready
+
+      # ─── Step 3b: Create Application (subscription path) ────────────────────
+      - stepId: create-application
+        description: >
+          Create a new portal application to hold the subscribed API key.
+          Application name defaults to "agent-<apiHandle>-app" if not provided.
+          Falls back to list-applications on 409 (already exists).
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/applications"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            name: $inputs.applicationName != null ? $inputs.applicationName : "agent-{$inputs.apiHandle}-app"
+            description: "Agent-created application for {$inputs.apiName}."
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          applicationId: $response.body.applicationId
+          applicationName: $response.body.name
+        onSuccess:
+          - name: proceed-to-subscribe
+            type: goto
+            stepId: subscribe-to-api
+        onFailure:
+          - name: app-already-exists
+            type: goto
+            stepId: list-applications
+            criteria:
+              - condition: $statusCode == 409
+
+      # ─── Step 3b-fallback: List Applications ────────────────────────────────
+      - stepId: list-applications
+        description: Reuse an existing application rather than creating a duplicate.
+        x-rest-endpoint: "GET {portalHost}/devportal/organizations/{orgName}/applications"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          applicationId: $response.body[0].applicationId
+        onSuccess:
+          - name: proceed-to-subscribe
+            type: goto
+            stepId: subscribe-to-api
+
+      # ─── Step 4: Subscribe to API ────────────────────────────────────────────
+      - stepId: subscribe-to-api
+        description: >
+          Subscribe the application to the API under the chosen plan.
+          Subscribing may incur costs — the operator confirmed this was required
+          in the confirm-subscription-required gate.
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/subscriptions"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            applicationID: $steps.create-application.outputs.applicationId
+            apiId: $inputs.apiId
+            policyName: $inputs.subscriptionPlan
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          subscriptionId: $response.body.subscriptionId
+        onSuccess:
+          - name: proceed-to-generate-key
+            type: goto
+            stepId: generate-subscribed-api-key
+        onFailure:
+          - name: already-subscribed
+            type: goto
+            stepId: generate-subscribed-api-key
+            criteria:
+              - condition: $statusCode == 409
+            description: Already subscribed — proceed to key generation.
+
+      # ─── Step 5: Generate Application API Key (subscription path) ───────────
+      - stepId: generate-subscribed-api-key
+        description: >
+          Generate an API key scoped to the subscribed application.
+          Key name follows the same "agent-<apiHandle>-<keyType>" convention.
+          Expiry is set from expirySeconds input.
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/applications/{applicationId}/api-keys/generate"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: applicationId
+            in: path
+            value: $steps.create-application.outputs.applicationId
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            apiId: $inputs.apiId
+            devportalAppId: $steps.create-application.outputs.applicationId
+            keyType: $inputs.keyType
+            name: "agent-{$inputs.apiHandle}-{$inputs.keyType}"
+            description: "Agent-generated key for {$inputs.apiName}. Created automatically — do not share."
+            validityPeriod: $inputs.expirySeconds != null ? $inputs.expirySeconds : ($inputs.keyType == 'PRODUCTION' ? 86400 : 3600)
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          apiKey: $response.body.apiKey
+          keyId: $response.body.id
+          keyName: $response.body.name
+          expiresAt: $response.body.expiresAt
+        onSuccess:
+          - name: key-ready
+            type: goto
+            stepId: key-ready
+
+      # ─── Step 6: Key Ready ───────────────────────────────────────────────────
+      - stepId: key-ready
+        description: >
+          API key successfully generated. This step makes no HTTP request.
+
+          The key name "agent-<apiHandle>-<keyType>" identifies it as agent-generated
+          in the portal key management UI.
+
+          Pass the key in the header named in the API spec's securitySchemes
+          (commonly "x-api-key" or "api-key"). Do NOT use the portal bearer token
+          to call the target API.
+
+          Expiry: check expiresAt — refresh before it lapses to avoid 401s.
+
+          Now plug this key into your integration code's API_KEY environment variable
+          and verify the integration works end-to-end.
+        x-no-operation: true
+        outputs:
+          apiKey: $steps.generate-platform-api-key.outputs.apiKey != null ? $steps.generate-platform-api-key.outputs.apiKey : $steps.generate-subscribed-api-key.outputs.apiKey
+          keyId: $steps.generate-platform-api-key.outputs.keyId != null ? $steps.generate-platform-api-key.outputs.keyId : $steps.generate-subscribed-api-key.outputs.keyId
+          keyName: $steps.generate-platform-api-key.outputs.keyName != null ? $steps.generate-platform-api-key.outputs.keyName : $steps.generate-subscribed-api-key.outputs.keyName
+          expiresAt: $steps.generate-platform-api-key.outputs.expiresAt != null ? $steps.generate-platform-api-key.outputs.expiresAt : $steps.generate-subscribed-api-key.outputs.expiresAt
+
+    outputs:
+      apiKey: $steps.key-ready.outputs.apiKey
+      keyId: $steps.key-ready.outputs.keyId
+      keyName: $steps.key-ready.outputs.keyName
+      expiresAt: $steps.key-ready.outputs.expiresAt

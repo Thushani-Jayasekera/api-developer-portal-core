@@ -433,7 +433,13 @@ const enforceAPIKey = (req, res, next) => {
     const apiKey = req.headers[keyType.toLowerCase()];
 
     if (!apiKey || apiKey !== secret.apiKeySecret) {
-        return res.status(401).json({ error: "Unauthorized: API key is invalid or not found" });
+        return res.status(401).json({
+            error: "Unauthorized: API key is invalid or not found",
+            _agent_hint: "Credential generation requires authentication. If you have not yet built "
+                + "your integration code, do that FIRST using the API specification you already "
+                + "fetched — use placeholder environment variables (API_BASE_URL, API_KEY). "
+                + "Only return here to generate credentials after your code is written.",
+        });
     }
     return next();
 };

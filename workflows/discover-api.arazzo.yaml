@@ -1,0 +1,358 @@
+arazzo: 1.0.0
+
+info:
+  title: Discover API
+  summary: Search the catalog, evaluate candidates, and recommend the best API
+  description: |
+    Discovery-only workflow. Finds and evaluates APIs for a given use case.
+    Stops after recommending the best match. Generates no credentials.
+
+    Use this when the agent's task is research or selection — not integration.
+    To proceed to integration after discovery, use the integrate-api workflow
+    with the returned apiHandle.
+
+    ## How to use (REST)
+    All catalog and detail endpoints require:
+      Accept: application/json
+    Without this header the portal returns HTML, not structured data.
+
+    ## How to use (MCP)
+    If your agent supports MCP, connect once and call tools — no Accept headers
+    or URL construction needed.
+      Connect: POST {portalHost}/{orgName}/mcp   (Streamable HTTP transport)
+
+  version: 1.0.0
+
+workflows:
+
+  - workflowId: discover-api
+    summary: Search the catalog, evaluate candidates, and recommend the best API
+    description: |
+      Discovery-only workflow. Use this when the agent needs to find an API for a
+      given use case but credential generation is not (yet) required.
+
+      ## Entry routing
+        - apiHandle given: skip catalog search, fetch that API directly (single result).
+        - searchQuery or useCase given: search the catalog, evaluate up to maxCandidates
+          APIs (fetch details + spec for each), then recommend the best match.
+
+      ## What this workflow does NOT do
+        - No application creation, subscription, or credential generation.
+        - Consumers that need credentials should pass the returned apiHandle to
+          the integrate-api workflow with generateCredentials: true.
+    x-agent-access:
+      level: full
+
+    inputs:
+      type: object
+      required:
+        - orgName
+      properties:
+        orgName:
+          type: string
+          description: >
+            Organisation name — the first path segment of any portal URL.
+            Example: for https://portal.example.com/acme/views/default/apis, orgName is "acme".
+        viewName:
+          type: string
+          description: View name to browse. Defaults to "default".
+          default: default
+        apiHandle:
+          type: string
+          description: >
+            If the exact API handle is already known, set this to skip the catalog search.
+            The workflow will fetch that API directly and return a single result.
+            A handle is a URL-safe identifier like "payment-api" or "weather-v2".
+        useCase:
+          type: string
+          description: >
+            Human-readable description of what the API needs to do.
+            Used to rank candidates when multiple results are returned.
+            Example: "Send transactional emails", "Verify a user's identity".
+        searchQuery:
+          type: string
+          description: >
+            Keyword(s) to search the catalog. Derived from useCase if omitted.
+            Example: "email", "identity", "weather".
+        maxCandidates:
+          type: integer
+          description: Maximum number of candidate APIs to evaluate. Defaults to 3.
+          default: 3
+
+    steps:
+
+      # ─── Step 1: Route ──────────────────────────────────────────────────────
+      - stepId: resolve-target
+        description: >
+          Routing decision. If apiHandle is already known, skip catalog search
+          and fetch that API directly — exactly one result will be returned.
+          Otherwise, search the catalog first.
+        x-no-operation: true
+        onSuccess:
+          - name: handle-known-skip-search
+            type: goto
+            stepId: get-api-details
+            criteria:
+              - condition: $inputs.apiHandle != null
+          - name: search-catalog
+            type: goto
+            stepId: search-catalog
+
+      # ─── Step 2: Search Catalog (skipped when apiHandle is given) ───────────
+      - stepId: search-catalog
+        description: >
+          Search the API catalog for APIs matching the search query or use case.
+          Returns a list of candidate APIs with summary information.
+          Skipped when apiHandle is provided — resolve-target routes past this step.
+        x-mcp-equivalent:
+          tool: list_apis
+          input: '{ "query": "<searchQuery>", "view": "<viewName>" }'
+          note: No Accept header needed. MCP returns structured JSON directly.
+        x-rest-endpoint: "GET {portalHost}/{orgName}/views/{viewName}/apis"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: viewName
+            in: path
+            value: $inputs.viewName
+          - name: query
+            in: query
+            value: $inputs.searchQuery != null ? $inputs.searchQuery : $inputs.useCase
+          - name: Accept
+            in: header
+            value: application/json
+        successCriteria:
+          - condition: $statusCode == 200
+          - condition: $response.body.count > 0
+            context: $response.body
+            type: jsonpath
+        outputs:
+          apis: $response.body.apis
+          count: $response.body.count
+        onSuccess:
+          - name: proceed-to-evaluate
+            type: goto
+            stepId: get-api-details
+        onFailure:
+          - name: no-results
+            type: end
+            criteria:
+              - condition: $response.body.count == 0
+            description: >
+              No APIs matched the search query. Return the empty result to the agent
+              and ask the user to refine the use case or try different keywords.
+
+      # ─── Step 3: Get API Details ─────────────────────────────────────────────
+      - stepId: get-api-details
+        description: >
+          Fetch full details for the target API, including agent_access level,
+          gateway_vendor, subscription_required flag, endpoints, and available plans.
+
+          Target handle resolution:
+            - apiHandle input given → use it directly (single known API).
+            - Coming from search-catalog → use the first/best result handle.
+              When multiple candidates were returned, the agent should call this
+              step for each candidate (up to maxCandidates), filter out hidden APIs,
+              and proceed to get-api-specification for each accessible one.
+        x-mcp-equivalent:
+          tool: get_api_details
+          input: '{ "apiHandle": "<apiHandle>", "view": "<viewName>" }'
+          note: Returns the same fields as the REST response. No Accept header needed.
+        x-iteration:
+          note: >
+            When coming from search-catalog with multiple results, the agent iterates
+            this step and get-api-specification over each candidate (up to maxCandidates),
+            skipping hidden ones, before proceeding to recommend-api.
+          over: $steps.search-catalog.outputs.apis
+          limit: $inputs.maxCandidates
+          filter: agent_access.level != 'hidden'
+        x-rest-endpoint: "GET {portalHost}/{orgName}/views/{viewName}/api/{apiHandle}"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: viewName
+            in: path
+            value: $inputs.viewName
+          - name: apiHandle
+            in: path
+            value: $inputs.apiHandle != null ? $inputs.apiHandle : $steps.search-catalog.outputs.apis[0].handle
+          - name: Accept
+            in: header
+            value: application/json
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          apiId: $response.body.id
+          apiName: $response.body.name
+          apiHandle: $response.body.handle
+          apiType: $response.body.type
+          agentAccessLevel: $response.body.agent_access.level
+          agentAccessReason: $response.body.agent_access.reason
+          gatewayVendor: $response.body.gateway_vendor
+          subscriptionRequired: $response.body.subscription_required
+          recommendedBaseUrl: $response.body.recommended_base_url
+          subscriptionPlans: $response.body.subscription_plans
+        onSuccess:
+          - name: hidden-stop
+            type: end
+            criteria:
+              - condition: $response.body.agent_access.level == 'hidden'
+            description: API is hidden from agents. Select a different API.
+          - name: human-approval-required
+            type: end
+            criteria:
+              - condition: $response.body.agent_access.level == 'human_approval'
+            x-agent-access:
+              level: human_approval
+              reason: >
+                This API requires human operator approval before an agent can subscribe or invoke.
+                Pause here. Show the operator the API name and the reason from agent_access.reason.
+                Resume only after explicit operator confirmation.
+          - name: proceed-to-spec
+            type: goto
+            stepId: get-api-specification
+
+      # ─── Step 4: Get API Specification ──────────────────────────────────────
+      - stepId: get-api-specification
+        description: >
+          Fetch the raw OpenAPI / AsyncAPI / GraphQL specification for the API.
+          Read it thoroughly: endpoints, required parameters, response shapes,
+          and the securitySchemes section — this determines the credential path
+          if the caller proceeds to integrate-api.
+        x-mcp-equivalent:
+          tool: get_api_specification
+          input: '{ "apiHandle": "<apiHandle>", "view": "<viewName>" }'
+          resource: "api://<apiHandle>/spec"
+          note: No Accept header needed. MCP returns the raw spec directly.
+        x-rest-endpoint: "GET {portalHost}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: viewName
+            in: path
+            value: $inputs.viewName
+          - name: apiHandle
+            in: path
+            value: $steps.get-api-details.outputs.apiHandle
+          - name: Accept
+            in: header
+            value: application/json
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          specification: $response.body
+          securitySchemes: $response.body.components.securitySchemes
+          apiUsageWorkflowAvailable: $response.body._api_usage_workflow_available
+          apiUsageWorkflowLink: $response.body._api_usage_workflow_link
+        onSuccess:
+          - name: api-usage-workflow-available
+            type: goto
+            stepId: get-api-usage-workflow
+            criteria:
+              - condition: $response.body._api_usage_workflow_available == true
+          - name: no-usage-workflow-proceed
+            type: goto
+            stepId: recommend-api
+
+      # ─── Step 4b: Get API Usage Workflow (optional) ─────────────────────────
+      - stepId: get-api-usage-workflow
+        description: >
+          Fetch the API usage workflow for this API. Usage workflows describe how
+          the API's own operations connect together for real-world use cases — the
+          correct sequence of calls, required inputs/outputs between steps, and
+          supported scenarios. Use this as the blueprint for building your integration.
+
+          NOTE: This is different from the portal integration workflows (discover-api,
+          integrate-api, generate-*-key) which describe how to interact with the
+          developer portal itself.
+
+          This step is only reached when the specification response indicated
+          _api_usage_workflow_available: true.
+        x-mcp-equivalent:
+          note: Not yet available via MCP — use the REST endpoint.
+        x-rest-endpoint: "GET {portalHost}/{orgName}/views/{viewName}/api/{apiHandle}/docs/workflow"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: viewName
+            in: path
+            value: $inputs.viewName
+          - name: apiHandle
+            in: path
+            value: $steps.get-api-details.outputs.apiHandle
+          - name: Accept
+            in: header
+            value: application/json
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          apiUsageWorkflow: $response.body
+        onSuccess:
+          - name: proceed-to-recommend
+            type: goto
+            stepId: recommend-api
+        onFailure:
+          - name: usage-workflow-not-found
+            type: goto
+            stepId: recommend-api
+            description: >
+              API usage workflow fetch failed — proceed without it. The API
+              specification alone is sufficient to build an integration.
+
+      # ─── Step 5: Recommend API ───────────────────────────────────────────────
+      - stepId: recommend-api
+        description: >
+          Synthesise the details and specs collected across all evaluated candidates.
+
+          When apiHandle was given as input, there is exactly one candidate —
+          return it directly without ranking.
+
+          When multiple candidates were evaluated, select the one that best satisfies
+          the use case based on:
+            1. Relevance of endpoints and description to useCase.
+            2. Quality and completeness of the OpenAPI spec.
+            3. agent_access.level — prefer "full" over "human_approval".
+            4. Subscription cost — prefer lower-cost or free plans where equivalent.
+
+          Return a structured recommendation. Do NOT generate credentials.
+          To proceed, the caller should run integrate-api with the selected
+          apiHandle and generateCredentials: true.
+
+          If an API usage workflow was fetched, include it in the recommendation.
+          The usage workflow describes how the API's operations connect for
+          real-world use cases and should be used as the blueprint for building
+          the integration.
+        x-no-operation: true
+        outputs:
+          apiId: $steps.get-api-details.outputs.apiId
+          apiName: $steps.get-api-details.outputs.apiName
+          apiHandle: $steps.get-api-details.outputs.apiHandle
+          apiType: $steps.get-api-details.outputs.apiType
+          agentAccessLevel: $steps.get-api-details.outputs.agentAccessLevel
+          gatewayVendor: $steps.get-api-details.outputs.gatewayVendor
+          subscriptionRequired: $steps.get-api-details.outputs.subscriptionRequired
+          recommendedBaseUrl: $steps.get-api-details.outputs.recommendedBaseUrl
+          subscriptionPlans: $steps.get-api-details.outputs.subscriptionPlans
+          specification: $steps.get-api-specification.outputs.specification
+          securitySchemes: $steps.get-api-specification.outputs.securitySchemes
+          apiUsageWorkflow: $steps.get-api-usage-workflow.outputs.apiUsageWorkflow
+          allCandidates: $steps.search-catalog.outputs.apis
+
+    outputs:
+      apiId: $steps.recommend-api.outputs.apiId
+      apiName: $steps.recommend-api.outputs.apiName
+      apiHandle: $steps.recommend-api.outputs.apiHandle
+      apiType: $steps.recommend-api.outputs.apiType
+      agentAccessLevel: $steps.recommend-api.outputs.agentAccessLevel
+      gatewayVendor: $steps.recommend-api.outputs.gatewayVendor
+      subscriptionRequired: $steps.recommend-api.outputs.subscriptionRequired
+      recommendedBaseUrl: $steps.recommend-api.outputs.recommendedBaseUrl
+      subscriptionPlans: $steps.recommend-api.outputs.subscriptionPlans
+      specification: $steps.recommend-api.outputs.specification
+      securitySchemes: $steps.recommend-api.outputs.securitySchemes
+      apiUsageWorkflow: $steps.recommend-api.outputs.apiUsageWorkflow
+      allCandidates: $steps.recommend-api.outputs.allCandidates

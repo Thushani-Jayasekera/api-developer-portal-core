@@ -237,6 +237,13 @@ const handleLogOutLanding = async (req, res) => {
 }
 
 const handleSilentSSO = async (req, res, next) => {
+    // Only attempt silent SSO for pages that require authentication.
+    // Unauthenticated access to public pages (catalog, API detail, spec) should
+    // pass through without triggering an IDP redirect.
+    const requiresAuth = config.authenticatedPages.some(pattern => minimatch.minimatch(req.originalUrl, pattern));
+    if (!requiresAuth) {
+        return next();
+    }
 
     await req.session.save((err) => {
         req.session.returnTo = req.originalUrl;

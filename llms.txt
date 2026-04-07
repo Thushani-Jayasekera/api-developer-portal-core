@@ -1,0 +1,194 @@
+# API Developer Portal
+
+> A developer portal for discovering, subscribing to, and integrating with APIs programmatically.
+> Agents can browse the full API catalog, fetch OpenAPI/AsyncAPI specifications, subscribe to APIs,
+> and generate credentials — either through MCP tool calls or REST JSON endpoints.
+
+> **IMPORTANT: All REST API requests MUST include the `Accept: application/json` header.**
+> Without this header, the portal returns HTML pages intended for browsers — not machine-readable
+> JSON. Every endpoint listed below requires `Accept: application/json` to return structured data.
+
+## IMPORTANT: The Portal Is a Setup Tool — Not a Runtime Dependency
+
+**Use the portal only during the setup/provisioning phase** — to discover an API, subscribe to it,
+and obtain credentials. Once you have the target API's base URL and credentials, your application
+should call the target API directly. The portal must NOT appear in your final application.
+
+**Correct model:**
+
+  1. Agent uses the portal → discovers the API, fetches its OpenAPI/AsyncAPI specification
+    and fetches Arazzo specification.
+  2. Agent builds the integration code using the spec and Arazzo spec: HTTP client, request/response
+     models, error handling, etc. Use placeholder environment variables for credentials
+     (e.g. API_BASE_URL, API_KEY) — do NOT block on obtaining real credentials.
+  3. Agent returns to the portal → creates an app, subscribes (if required), generates credentials.
+  4. Agent stores the resulting base URL + credentials in the application's config (e.g. .env file)
+     and verifies the integration works end-to-end.
+
+  Build first, provision later: Use the API spec to write integration code.
+  If a request fails when trying to generate credentials with 401, instruct the user to log in to the portal,
+  create an app, subscribe to the API (if needed), and generate an API Key.
+
+**Things to avoid in the application you build:**
+
+- Do NOT create a portal/devportal client class in the application.
+- Do NOT call portal endpoints at application startup, in health checks, or at request time.
+- Do NOT expose portal routes (e.g. /api/portal/...) to end users of the application.
+- Do NOT store portal URLs or portal bearer tokens in the application's runtime config.
+
+The portal is an agent-facing provisioning tool. End users of the application you build have no
+business interacting with the portal. Treat it the same way you treat a CI pipeline or a
+one-time database migration: useful during setup, invisible at runtime.
+
+## Quick Start for MCP-Capable Agents (Recommended)
+
+If your agent speaks MCP, connect directly — no URL fetching needed:
+
+  POST {host}/{orgName}/mcp
+  Transport: Streamable HTTP
+
+Replace {orgName} with the organisation name (first path segment of any portal URL).
+Once connected, call tools/list to see everything available.
+
+Tools available through MCP:
+  Discovery (no auth): list_apis, get_api_details, get_api_specification,
+                       list_mcp_servers, get_mcp_server_details, list_subscription_plans
+  Applications (auth): create_application, list_applications, delete_application
+  Subscriptions (auth): subscribe_to_api, list_subscriptions, unsubscribe
+  Keys (auth):          generate_api_key, list_api_keys, revoke_api_key
+
+The MCP server also exposes:
+  Resources: per-API specs, documentation pages, MCP server schemas,
+             portal integration guide, error reference, auth guide, access level rules
+  Prompts:   discover_and_subscribe, integrate_api, explain_access_levels, troubleshoot_error
+
+---
+
+## Getting Started (REST fallback — for agents that do not speak MCP)
+
+The portal is organised by organisation (org). Each org has its own API catalog.
+To get started, you need to know the org name — then fetch its discovery document.
+
+### Step 1 — Find the org name
+
+If the user mentioned an org name explicitly (e.g. "use the acme org") or gave you a
+portal URL (e.g. {host}/acme/views/default/apis), extract the org name from that.
+The org name is the first path segment after the portal host.
+Only ask the user for the org name if it is genuinely unknown from context.
+
+### Step 2 — Fetch the per-org discovery document
+
+  {host}/{orgName}/agent.json
+  (replace {orgName} with the org name you found in step 1)
+
+This returns:
+- The MCP endpoint URL for this org (recommended connection method)
+- Concrete, ready-to-call REST URLs for all capabilities (no further substitution needed)
+- A workflows array pointing to the Arazzo integration workflow — a machine-executable
+  step-by-step guide with explicit branching, input/output mappings, and human approval gates
+
+## Integration Workflows (Arazzo)
+
+Each workflow phase has its own file — fetch only what you need for your current step.
+
+  Phase 1 — Discovery (no auth):
+    {host}/workflows/discover-api.arazzo.yaml
+    Use this standalone for research or API selection — it stops after recommending
+    the best match and generates no credentials. Also the first step of a full integration.
+
+  Phase 2 — Build integration code (no file needed):
+    Use the spec from Phase 1 to write your HTTP client, request/response models,
+    and error handling with placeholder env vars (API_BASE_URL, API_KEY).
+    Use the sandbox endpoint if available, otherwise production.
+    Build BEFORE requesting credentials — do not wait for provisioning.
+
+  Phase 3 — Generate credentials (auth required, fetch ONE based on gateway):
+    {host}/workflows/generate-wso2-key.arazzo.yaml          (gateway_vendor == "wso2/api-platform")
+    {host}/workflows/generate-cloud-api-key.arazzo.yaml     (other gateways + api_key scheme)
+    {host}/workflows/generate-oauth2-credentials.arazzo.yaml (other gateways + oauth2 scheme)
+
+  Orchestrator (references all phases):
+    {host}/workflows/integrate-api.arazzo.yaml
+
+### Human approval gates
+
+Two points in the workflow require you to pause and confirm with the operator:
+
+  1. Before generating credentials — unless the operator has explicitly requested it,
+     pause at the credential-generation step. Show the API name and available plans,
+     then ask: "Do you want me to generate credentials for <apiName>? [yes / no]"
+     Proceed only on confirmation.
+
+  2. Before subscribing to an API — subscribing creates a formal relationship and may
+     incur billing charges. Always confirm with the operator before proceeding,
+     even if credential generation was already approved.
+
+## REST API Catalog
+
+{viewName} defaults to `default` when not specified by the user.
+
+Call these endpoints in order — each step depends on the previous one:
+
+### 1. List APIs
+
+  GET {host}/{orgName}/views/{viewName}/apis
+  GET {host}/{orgName}/views/{viewName}/apis?query=payment   (keyword search)
+  Accept: application/json
+
+Returns a list of APIs with summary info. Use this to find candidate `apiHandle` values.
+
+### 2. Get API Details
+
+  GET {host}/{orgName}/views/{viewName}/api/{apiHandle}
+  Accept: application/json
+
+Returns full detail for a single API. Key fields to check:
+  agent_access.level      — full | human_approval | hidden (see Agent Access Levels below)
+  agent_access.reason     — explanation shown to the operator when approval is required
+  gateway_vendor          — determines which credential workflow to use (see Integration Workflows above)
+  subscription_required   — if true, the agent must subscribe before generating credentials
+  recommended_base_url    — the target API's base URL; use this in your integration code
+  subscription_plans      — available plans and their costs; show to operator before subscribing
+  endpoints               - base url of the API
+
+### 3. Fetch API Specification
+
+  GET {host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification
+  Accept: application/json
+
+Returns the raw OpenAPI / AsyncAPI / GraphQL spec. Read the `securitySchemes` section —
+it determines which credential workflow to use alongside `gateway_vendor`.
+
+### 4. Fetch API Usage Workflow (if available)
+
+  GET {host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/workflow
+  Accept: application/json
+
+Only fetch this when the detail or spec response indicates it is available
+(`_api_usage_workflow_available: true` / `_api_usage_workflow_link` present).
+
+This describes how the API's own operations connect for real-world use cases —
+the correct sequence of calls, inputs/outputs between steps, and supported scenarios.
+Use it as the blueprint for building your integration code.
+
+Note: This is different from the portal integration workflows (listed above under
+"Integration Workflows"), which describe how to interact with this developer portal.
+
+## MCP Servers Catalog
+
+List available MCP servers (JSON):
+  {host}/{orgName}/views/{viewName}/mcps
+  Accept: application/json
+
+## Agent Access Levels
+
+Each API declares an agent_access level in its JSON response and as MCP tool output:
+  full            — agent can discover, read, subscribe, and invoke freely
+  human_approval  — The agent must obtain explicit approval from its human operator 
+                    before using the API, subscribing, or generating credentials.
+  hidden          — not visible to agents at all
+
+## Authentication
+
+Discovery tools and endpoints require no authentication.
+Subscription, application, and key management require a bearer token.

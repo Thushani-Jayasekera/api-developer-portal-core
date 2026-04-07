@@ -284,3 +284,4 @@ const agentActivityLogger = (req, res, next) => {
 };
 
 module.exports = agentActivityLogger;
+module.exports.resolveAgentIdentity = resolveAgentIdentity;

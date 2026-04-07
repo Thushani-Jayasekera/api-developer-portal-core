@@ -1,0 +1,413 @@
+arazzo: 1.0.0
+
+info:
+  title: Integrate API — Orchestrator
+  summary: Discover an API, build integration code, then generate credentials
+  description: |
+    Lightweight orchestrator that ties together the separate workflow files.
+    Each phase is a self-contained workflow — fetch only what you need.
+
+    ## Phase 1 — Discovery  (discover-api.arazzo.yaml)
+    Find and evaluate APIs. No auth required.
+
+    ## Phase 2 — Build integration code  (no workflow file — agent action)
+    Use the spec from Phase 1 to write your integration code with placeholder
+    credentials (API_BASE_URL, API_KEY). Do NOT skip this step.
+
+    ## Phase 3 — Generate credentials  (fetch the file matching your gateway)
+    Only after code is built, fetch the appropriate credential workflow:
+      - gateway_vendor == "wso2/api-platform"          → generate-wso2-key.arazzo.yaml
+      - other gateways + securityScheme api_key         → generate-cloud-api-key.arazzo.yaml
+      - other gateways + securityScheme oauth2          → generate-oauth2-credentials.arazzo.yaml
+
+    ## Human approval gates
+      - discover-api / check-agent-access: pauses if agent_access.level == "human_approval"
+      - integrate-api / confirm-credential-generation: pauses unless generateCredentials: true
+      - credential workflows / subscribe-to-api: pauses — subscribing may incur costs
+
+  version: 1.0.0
+
+x-connection-methods:
+  mcp:
+    description: Recommended for MCP-capable agents. Connect once, call tools — no URL construction or Accept headers needed.
+    url: "{portalHost}/{orgName}/mcp"
+    transport: streamable-http
+    auth: "Authorization: Bearer <token> in HTTP request headers"
+    tools_reference: "Call tools/list after connecting to see all available tools"
+  rest:
+    description: REST JSON API for agents that do not speak MCP.
+    base_url: "{portalHost}"
+    required_header: "Accept: application/json  (on all catalog/detail GET requests)"
+    auth_header: "Authorization: Bearer <token>  (on application, subscription, and key endpoints)"
+    discovery: "GET {portalHost}/{orgName}/agent.json  for concrete URLs"
+
+x-workflow-files:
+  description: >
+    Each workflow lives in its own file. Fetch only the file you need for your
+    current phase. This keeps payloads small and avoids loading credential
+    generation logic during discovery.
+  files:
+    - file: discover-api.arazzo.yaml
+      workflowId: discover-api
+      use_when: "Always — this is the first step. No auth required."
+    - file: generate-wso2-key.arazzo.yaml
+      workflowId: generate-wso2-platform-api-key
+      use_when: "gateway_vendor == 'wso2/api-platform' and securityScheme is api_key."
+    - file: generate-cloud-api-key.arazzo.yaml
+      workflowId: generate-cloud-gateway-api-key
+      use_when: "gateway_vendor is NOT 'wso2/api-platform' and securityScheme is api_key."
+    - file: generate-oauth2-credentials.arazzo.yaml
+      workflowId: generate-oauth2-credentials
+      use_when: "gateway_vendor is NOT 'wso2/api-platform' and securityScheme is oauth2."
+
+workflows:
+
+  - workflowId: integrate-api
+    summary: Discover, build integration code, then generate credentials
+    description: |
+      Full integration lifecycle: discover the best API → build integration code using
+      the spec → obtain credentials → plug them in → verify.
+
+      ## Phase 1 — Discovery
+      Step 1 calls the discover-api workflow (discover-api.arazzo.yaml). Pass either:
+        - apiHandle: known handle → one API is returned directly, no search needed.
+        - searchQuery / useCase: searches the catalog and selects the best match.
+
+      ## Phase 2 — Build integration code (BEFORE credential generation)
+      After discovery the agent has the full API specification and recommendedBaseUrl.
+      This is everything needed to write the integration code: HTTP client setup,
+      request/response models, error handling, retry logic, etc.
+
+      The agent MUST build the integration code now, using placeholder environment
+      variables for credentials (e.g. API_BASE_URL, API_KEY). Do NOT wait for
+      credential generation — it requires authentication, human approval, and may
+      fail. Building first ensures progress is not blocked by provisioning issues.
+
+      For API_BASE_URL, use the sandbox endpoint if available, otherwise production.
+
+      ## Phase 3 — Credential generation
+      Only after code is written, fetch the credential workflow matching the
+      gateway_vendor and securityScheme from the discovery outputs. See
+      x-workflow-files above for the mapping.
+
+      This workflow will NOT proceed to credential generation automatically unless
+      `generateCredentials: true` is explicitly set in the inputs. When it is not set,
+      the agent MUST pause at confirm-credential-generation and ask the human operator.
+    x-agent-access:
+      level: full
+
+    inputs:
+      type: object
+      required:
+        - orgName
+        - bearerToken
+      properties:
+        orgName:
+          type: string
+          description: Organisation name — first path segment of any portal URL.
+        viewName:
+          type: string
+          description: View name to browse. Defaults to "default".
+          default: default
+        apiHandle:
+          type: string
+          description: >
+            If the exact API handle is already known, pass it here to skip catalog search.
+        searchQuery:
+          type: string
+          description: Keyword to search for in API names, descriptions, and tags.
+        useCase:
+          type: string
+          description: Human-readable description of what the API needs to do.
+        bearerToken:
+          type: string
+          description: >
+            User-scoped portal bearer token. Required for credential generation (Phase 3).
+            Not needed for discovery (Phase 1) or code building (Phase 2).
+        keyType:
+          type: string
+          enum: [PRODUCTION, SANDBOX]
+          description: Whether to generate a production or sandbox key.
+          default: SANDBOX
+        generateCredentials:
+          type: boolean
+          description: >
+            Set to true when the agent's prompt explicitly requested credential
+            generation. When false or omitted, the agent MUST pause at
+            confirm-credential-generation and ask the human operator.
+
+    steps:
+
+      # ─── Phase 1: Discover ──────────────────────────────────────────────────
+      - stepId: discover
+        description: >
+          Run the discover-api workflow to find and evaluate the target API.
+          Fetch discover-api.arazzo.yaml for the full workflow definition.
+        workflowId: discover-api
+        parameters:
+          - name: orgName
+            in: workflow
+            value: $inputs.orgName
+          - name: viewName
+            in: workflow
+            value: $inputs.viewName
+          - name: apiHandle
+            in: workflow
+            value: $inputs.apiHandle
+          - name: searchQuery
+            in: workflow
+            value: $inputs.searchQuery
+          - name: useCase
+            in: workflow
+            value: $inputs.useCase
+        outputs:
+          apiId: $workflows.discover-api.outputs.apiId
+          apiName: $workflows.discover-api.outputs.apiName
+          apiHandle: $workflows.discover-api.outputs.apiHandle
+          gatewayVendor: $workflows.discover-api.outputs.gatewayVendor
+          subscriptionRequired: $workflows.discover-api.outputs.subscriptionRequired
+          recommendedBaseUrl: $workflows.discover-api.outputs.recommendedBaseUrl
+          subscriptionPlans: $workflows.discover-api.outputs.subscriptionPlans
+          specification: $workflows.discover-api.outputs.specification
+          securitySchemes: $workflows.discover-api.outputs.securitySchemes
+          apiUsageWorkflow: $workflows.discover-api.outputs.apiUsageWorkflow
+        onSuccess:
+          - name: proceed-to-build
+            type: goto
+            stepId: build-integration
+
+      # ─── Phase 2: Build Integration Code ────────────────────────────────────
+      - stepId: build-integration
+        description: >
+          BUILD THE INTEGRATION CODE NOW — before attempting credential generation.
+
+          You have everything you need from the discover step:
+            - Full API specification with endpoints, parameters, schemas, errors.
+            - recommendedBaseUrl — the target API's host.
+            - securitySchemes — what auth the target API expects.
+            - API usage workflow (if available) — describes how the API's own
+              operations connect for real-world use cases with the correct
+              sequence of calls and data flow between steps. This is different
+              from the portal integration workflows you are currently following.
+
+          What to build:
+            1. If an API usage workflow was returned, use it as the blueprint —
+               it defines the correct order of API calls, required inputs/outputs
+               between steps, and supported scenarios for each use case.
+            2. HTTP client configured for recommendedBaseUrl.
+            3. Request/response models matching the spec's schemas.
+            4. API call functions for the endpoints relevant to the use case.
+            5. Error handling based on the spec's error responses.
+            6. Environment variable placeholders:
+                 API_BASE_URL  (use sandbox endpoint if available, else production)
+                 API_KEY       (or OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET for OAuth2)
+
+          Do NOT hard-code credentials. Do NOT call the portal from the application.
+          Do NOT skip this step.
+        x-no-operation: true
+        outputs:
+          integrationBuilt: true
+        onSuccess:
+          - name: proceed-to-credential-gate
+            type: goto
+            stepId: confirm-credential-generation
+
+      # ─── Phase 3: Confirm Credential Generation ─────────────────────────────
+      - stepId: confirm-credential-generation
+        description: >
+          Decision gate before credential generation. The agent should only reach
+          here AFTER building the integration code.
+
+          Decision logic:
+            - generateCredentials == true → route to the correct credential workflow.
+            - Otherwise → PAUSE and ask the operator.
+
+          Routing (based on discovery outputs):
+            - gateway_vendor == "wso2/api-platform" → fetch generate-wso2-key.arazzo.yaml
+            - securitySchemes contains apiKey        → fetch generate-cloud-api-key.arazzo.yaml
+            - securitySchemes contains oauth2        → fetch generate-oauth2-credentials.arazzo.yaml
+        x-no-operation: true
+        x-agent-access:
+          level: human_approval
+          reason: >
+            Credential generation creates application records, may trigger billing,
+            and should not happen silently.
+        onSuccess:
+          - name: wso2-platform-api-pre-authorised
+            type: goto
+            stepId: generate-wso2-key
+            criteria:
+              - condition: $inputs.generateCredentials == true && $steps.discover.outputs.gatewayVendor == 'wso2/api-platform'
+          - name: cloud-api-key-pre-authorised
+            type: goto
+            stepId: generate-cloud-api-key
+            criteria:
+              - condition: $inputs.generateCredentials == true && "'apiKey' in $steps.discover.outputs.securitySchemes"
+          - name: oauth2-pre-authorised
+            type: goto
+            stepId: generate-oauth2-creds
+            criteria:
+              - condition: $inputs.generateCredentials == true
+          - name: operator-must-confirm
+            type: end
+            criteria:
+              - condition: $inputs.generateCredentials != true
+            description: >
+              Pause here. Show the operator the API name, description, and available plans.
+              Ask: "Do you want me to generate credentials for <apiName>? [yes / no]"
+              If yes, re-run with generateCredentials: true.
+
+      # ─── Phase 3a: WSO2 Platform API Key ────────────────────────────────────
+      - stepId: generate-wso2-key
+        description: >
+          Delegate to generate-wso2-platform-api-key workflow.
+          Fetch generate-wso2-key.arazzo.yaml for the full workflow definition.
+        workflowId: generate-wso2-platform-api-key
+        parameters:
+          - name: orgName
+            in: workflow
+            value: $inputs.orgName
+          - name: bearerToken
+            in: workflow
+            value: $inputs.bearerToken
+          - name: apiId
+            in: workflow
+            value: $steps.discover.outputs.apiId
+          - name: apiHandle
+            in: workflow
+            value: $steps.discover.outputs.apiHandle
+          - name: apiName
+            in: workflow
+            value: $steps.discover.outputs.apiName
+          - name: securitySchemes
+            in: workflow
+            value: $steps.discover.outputs.securitySchemes
+          - name: keyType
+            in: workflow
+            value: $inputs.keyType
+        outputs:
+          apiKey: $workflows.generate-wso2-platform-api-key.outputs.apiKey
+          keyId: $workflows.generate-wso2-platform-api-key.outputs.keyId
+          keyName: $workflows.generate-wso2-platform-api-key.outputs.keyName
+          expiresAt: $workflows.generate-wso2-platform-api-key.outputs.expiresAt
+        onSuccess:
+          - name: integration-complete
+            type: goto
+            stepId: integration-ready
+
+      # ─── Phase 3b: Cloud Gateway API Key ────────────────────────────────────
+      - stepId: generate-cloud-api-key
+        description: >
+          Delegate to generate-cloud-gateway-api-key workflow.
+          Fetch generate-cloud-api-key.arazzo.yaml for the full workflow definition.
+        workflowId: generate-cloud-gateway-api-key
+        parameters:
+          - name: orgName
+            in: workflow
+            value: $inputs.orgName
+          - name: bearerToken
+            in: workflow
+            value: $inputs.bearerToken
+          - name: apiId
+            in: workflow
+            value: $steps.discover.outputs.apiId
+          - name: apiHandle
+            in: workflow
+            value: $steps.discover.outputs.apiHandle
+          - name: apiName
+            in: workflow
+            value: $steps.discover.outputs.apiName
+          - name: securitySchemes
+            in: workflow
+            value: $steps.discover.outputs.securitySchemes
+          - name: subscriptionPlans
+            in: workflow
+            value: $steps.discover.outputs.subscriptionPlans
+          - name: keyType
+            in: workflow
+            value: $inputs.keyType
+        outputs:
+          apiKey: $workflows.generate-cloud-gateway-api-key.outputs.apiKey
+          applicationId: $workflows.generate-cloud-gateway-api-key.outputs.applicationId
+        onSuccess:
+          - name: integration-complete
+            type: goto
+            stepId: integration-ready
+
+      # ─── Phase 3c: OAuth2 Client Credentials ───────────────────────────────
+      - stepId: generate-oauth2-creds
+        description: >
+          Delegate to generate-oauth2-credentials workflow.
+          Fetch generate-oauth2-credentials.arazzo.yaml for the full workflow definition.
+        workflowId: generate-oauth2-credentials
+        parameters:
+          - name: orgName
+            in: workflow
+            value: $inputs.orgName
+          - name: bearerToken
+            in: workflow
+            value: $inputs.bearerToken
+          - name: apiId
+            in: workflow
+            value: $steps.discover.outputs.apiId
+          - name: apiHandle
+            in: workflow
+            value: $steps.discover.outputs.apiHandle
+          - name: apiName
+            in: workflow
+            value: $steps.discover.outputs.apiName
+          - name: securitySchemes
+            in: workflow
+            value: $steps.discover.outputs.securitySchemes
+          - name: subscriptionPlans
+            in: workflow
+            value: $steps.discover.outputs.subscriptionPlans
+          - name: keyType
+            in: workflow
+            value: $inputs.keyType
+        outputs:
+          clientId: $workflows.generate-oauth2-credentials.outputs.clientId
+          clientSecret: $workflows.generate-oauth2-credentials.outputs.clientSecret
+          tokenUrl: $workflows.generate-oauth2-credentials.outputs.tokenUrl
+          scopes: $workflows.generate-oauth2-credentials.outputs.scopes
+          applicationId: $workflows.generate-oauth2-credentials.outputs.applicationId
+        onSuccess:
+          - name: integration-complete
+            type: goto
+            stepId: integration-ready
+
+      # ─── Phase 4: Integration Ready ─────────────────────────────────────────
+      - stepId: integration-ready
+        description: >
+          Credentials generated. The integration code was built in Phase 2
+          with placeholder environment variables.
+
+          Now plug in the real values:
+            API_BASE_URL  = recommendedBaseUrl (from discover step)
+            API_KEY       = apiKey / accessToken (from the credential step that ran)
+
+          IMPORTANT — two different credentials, two different targets:
+            - Portal bearer token: used ONLY during this workflow. Do NOT include
+              in the application.
+            - API credential (apiKey / clientId+clientSecret): use this for every
+              call to the TARGET API.
+
+          Verify the integration works end-to-end with a test call.
+        x-no-operation: true
+        outputs:
+          apiBaseUrl: $steps.discover.outputs.recommendedBaseUrl
+          apiSpecification: $steps.discover.outputs.specification
+
+    outputs:
+      apiName: $steps.discover.outputs.apiName
+      apiBaseUrl: $steps.discover.outputs.recommendedBaseUrl
+      apiSpecification: $steps.discover.outputs.specification
+      apiUsageWorkflow: $steps.discover.outputs.apiUsageWorkflow
+      gatewayVendor: $steps.discover.outputs.gatewayVendor
+      platformApiKey: $steps.generate-wso2-key.outputs.apiKey
+      apiKey: $steps.generate-cloud-api-key.outputs.apiKey
+      oauthClientId: $steps.generate-oauth2-creds.outputs.clientId
+      oauthClientSecret: $steps.generate-oauth2-creds.outputs.clientSecret
+      oauthTokenUrl: $steps.generate-oauth2-creds.outputs.tokenUrl
+      oauthScopes: $steps.generate-oauth2-creds.outputs.scopes
+      applicationId: $steps.generate-cloud-api-key.outputs.applicationId

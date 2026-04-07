@@ -1,0 +1,264 @@
+arazzo: 1.0.0
+
+info:
+  title: Generate Cloud Gateway API Key
+  summary: Create an app, subscribe, and generate an API key for a Cloud Gateway API
+  description: |
+    Targeted key-generation workflow for Cloud Gateway APIs secured with api_key.
+
+    ## When to use
+    Only when gateway_vendor is NOT "wso2/api-platform" and securitySchemes contains apiKey.
+
+    ## Pre-requisites
+    The agent MUST have already:
+      1. Discovered the API (via discover-api workflow).
+      2. Built the integration code using the API spec with placeholder credentials.
+    Do NOT invoke this workflow until the integration code is written.
+
+    ## Flow
+      1. Verify api_key security scheme is present.
+      2. Create an application named "agent-<apiHandle>-app".
+      3. Subscribe the application to the API.
+      4. Generate an API key for the subscribed application.
+
+  version: 1.0.0
+
+workflows:
+
+  - workflowId: generate-cloud-gateway-api-key
+    summary: Create an app, subscribe, and generate an API key for a Cloud Gateway API
+    description: |
+      Targeted key-generation workflow for Cloud Gateway APIs secured with api_key.
+
+      ## Pre-conditions (caller must verify before invoking)
+        - gateway_vendor is NOT "wso2/api-platform"
+        - securitySchemes (fetched from the API) contains an apiKey entry
+        - Integration code is ALREADY BUILT using the API spec
+
+      ## What this workflow does
+        1. Checks the apiKey scheme is present in the fetched security scheme data.
+        2. Creates a new application named "agent-<apiHandle>-app" so it is clearly
+           identifiable as agent-created in the portal application list.
+        3. Subscribes the application to the API. Subscribing may incur costs —
+           this step carries a human_approval gate.
+        4. Generates an API key for the subscribed application using the standard
+           /applications/{applicationId}/api-keys/generate endpoint.
+
+      ## Key naming
+        The application name "agent-<apiHandle>-app" makes the origin clear.
+        The generated key is further named "agent-<apiHandle>-<keyType>".
+    x-agent-access:
+      level: full
+
+    inputs:
+      type: object
+      required:
+        - orgName
+        - bearerToken
+        - apiId
+        - apiHandle
+        - apiName
+        - securitySchemes
+      properties:
+        orgName:
+          type: string
+          description: Organisation name — first path segment of any portal URL.
+        bearerToken:
+          type: string
+          description: User-scoped portal bearer token.
+        apiId:
+          type: string
+          description: ID of the target API. Available from discover-api workflow outputs.
+        apiHandle:
+          type: string
+          description: URL-safe handle of the API. Used in application and key naming.
+        apiName:
+          type: string
+          description: Display name of the API. Used in application description.
+        securitySchemes:
+          type: object
+          description: >
+            securitySchemes object already fetched from the API
+            (discover-api workflow output: securitySchemes).
+            Must contain an apiKey entry for this workflow to proceed.
+        subscriptionPlans:
+          type: array
+          description: >
+            Subscription plans fetched from the API (discover-api workflow output:
+            subscriptionPlans). Used to select the default plan when subscriptionPlan
+            is not explicitly provided.
+        keyType:
+          type: string
+          enum: [PRODUCTION, SANDBOX]
+          description: Whether to generate a production or sandbox key.
+          default: SANDBOX
+        subscriptionPlan:
+          type: string
+          description: >
+            Subscription plan name to subscribe under (e.g. "Bronze", "Gold").
+            If omitted, the first available plan from subscriptionPlans is used.
+
+    steps:
+
+      # ─── Step 1: Verify API Key Security Scheme ──────────────────────────────
+      - stepId: verify-api-key-scheme
+        description: >
+          Check that the fetched API's securitySchemes contains an apiKey entry.
+          Stops here if not found — caller should use the OAuth2 workflow instead.
+        x-no-operation: true
+        successCriteria:
+          - condition: "'apiKey' in $inputs.securitySchemes"
+        onSuccess:
+          - name: proceed-to-create-app
+            type: goto
+            stepId: create-application
+        onFailure:
+          - name: wrong-security-scheme
+            type: end
+            description: >
+              No apiKey security scheme found in the fetched API data.
+              Use the OAuth2 credential path for this API instead.
+
+      # ─── Step 2: Create Application ──────────────────────────────────────────
+      - stepId: create-application
+        description: >
+          Create a new application named "agent-<apiHandle>-app" to hold the
+          subscription and key. The name clearly marks it as agent-created in
+          the portal application list.
+          Falls back to list-applications on 409 (application already exists).
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/applications"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            name: "agent-{$inputs.apiHandle}-app"
+            description: "Agent-created application for {$inputs.apiName}. Created automatically."
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          applicationId: $response.body.applicationId
+          applicationName: $response.body.name
+        onSuccess:
+          - name: proceed-to-subscribe
+            type: goto
+            stepId: subscribe-to-api
+        onFailure:
+          - name: app-already-exists
+            type: goto
+            stepId: list-applications
+            criteria:
+              - condition: $statusCode == 409
+
+      # ─── Step 2b: List Applications (fallback) ───────────────────────────────
+      - stepId: list-applications
+        description: >
+          Application with this name already exists. Fetch and reuse it rather
+          than creating a duplicate.
+        x-rest-endpoint: "GET {portalHost}/devportal/organizations/{orgName}/applications"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          applicationId: $response.body[0].applicationId
+          applicationName: $response.body[0].name
+        onSuccess:
+          - name: proceed-to-subscribe
+            type: goto
+            stepId: subscribe-to-api
+
+      # ─── Step 3: Subscribe to API ────────────────────────────────────────────
+      - stepId: subscribe-to-api
+        description: >
+          Subscribe the agent-created application to the API under the chosen plan.
+          Uses the first available plan from subscriptionPlans if subscriptionPlan
+          input is not specified.
+          Subscribing may incur costs — confirm with the operator before proceeding.
+        x-agent-access:
+          level: human_approval
+          reason: >
+            Subscribing creates a formal relationship and may incur billing charges
+            depending on the chosen plan. Confirm the plan with the operator before
+            proceeding.
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/subscriptions"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            applicationID: $steps.create-application.outputs.applicationId
+            apiId: $inputs.apiId
+            policyName: $inputs.subscriptionPlan != null ? $inputs.subscriptionPlan : $inputs.subscriptionPlans[0].name
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          subscriptionId: $response.body.subscriptionId
+        onSuccess:
+          - name: proceed-to-generate-key
+            type: goto
+            stepId: generate-api-key
+        onFailure:
+          - name: already-subscribed
+            type: goto
+            stepId: generate-api-key
+            criteria:
+              - condition: $statusCode == 409
+            description: Already subscribed — proceed to key generation.
+
+      # ─── Step 4: Generate API Key ────────────────────────────────────────────
+      - stepId: generate-api-key
+        description: >
+          Generate an API key for the subscribed application using the standard
+          Cloud Gateway key generation endpoint.
+          Key name follows the convention "agent-<apiHandle>-<keyType>" so it is
+          identifiable as agent-generated in the portal key list.
+
+          Now plug this key into your integration code's API_KEY environment variable
+          and verify the integration works end-to-end.
+        x-rest-endpoint: "POST {portalHost}/devportal/organizations/{orgName}/applications/{applicationId}/api-keys/generate"
+        parameters:
+          - name: orgName
+            in: path
+            value: $inputs.orgName
+          - name: applicationId
+            in: path
+            value: $steps.create-application.outputs.applicationId
+          - name: Authorization
+            in: header
+            value: Bearer $inputs.bearerToken
+        requestBody:
+          contentType: application/json
+          payload:
+            apiId: $inputs.apiId
+            devportalAppId: $steps.create-application.outputs.applicationId
+            keyType: $inputs.keyType
+            name: "agent-{$inputs.apiHandle}-{$inputs.keyType}"
+            description: "Agent-generated key for {$inputs.apiName}. Created automatically — do not share."
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          apiKey: $response.body.apiKey
+          keyId: $response.body.id
+          keyName: $response.body.name
+
+    outputs:
+      apiKey: $steps.generate-api-key.outputs.apiKey
+      keyId: $steps.generate-api-key.outputs.keyId
+      keyName: $steps.generate-api-key.outputs.keyName
+      applicationId: $steps.create-application.outputs.applicationId

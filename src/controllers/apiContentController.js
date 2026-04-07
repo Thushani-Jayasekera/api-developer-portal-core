@@ -480,7 +480,22 @@ const loadAPIContent = async (req, res) => {
                 if (metaData.apiInfo.apiType === 'MCP') {
                     return res.json(toAgentMCPDetail(metaData, schemaDefinition, baseUrl, host));
                 }
-                return res.json(toAgentApiDetail(metaData, apiDetail?.scopes, baseUrl, host));
+
+                // Check if a workflow definition exists for this API
+                let hasWorkflow = false;
+                try {
+                    const workflowFile = await apiDao.getAPIFile(
+                        constants.FILE_NAME.WORKFLOW_FILE_NAME,
+                        constants.DOC_TYPES.WORKFLOW_DEFINITION,
+                        orgID, apiID
+                    );
+                    hasWorkflow = !!(workflowFile && workflowFile.API_FILE);
+                    console.log("HAS WORKFLOW FILE", hasWorkflow)
+                } catch (_) {
+                    // No workflow — that's fine
+                }
+
+                return res.json(toAgentApiDetail(metaData, apiDetail?.scopes, baseUrl, host, hasWorkflow));
             }
 
             if (metaData.apiInfo.apiType == "MCP") {
@@ -544,9 +559,99 @@ const loadAPIDefinition = async (orgName, viewName, apiHandle) => {
                 }
             }
         templateContent.metaData = metaData;
+
+        // Check if a workflow definition (Arazzo) exists for this API
+        try {
+            const workflowFile = await apiDao.getAPIFile(
+                constants.FILE_NAME.WORKFLOW_FILE_NAME,
+                constants.DOC_TYPES.WORKFLOW_DEFINITION,
+                orgID, apiID
+            );
+            templateContent.hasWorkflow = !!(workflowFile && workflowFile.API_FILE);
+        } catch (_) {
+            templateContent.hasWorkflow = false;
+        }
     }
     return templateContent;
 }
+
+const loadWorkflow = async (req, res) => {
+
+    const { orgName, apiHandle, viewName } = req.params;
+    try {
+        const orgID = await adminDao.getOrgId(orgName);
+        const apiID = await apiDao.getAPIId(orgID, apiHandle);
+        const metaData = await apiMetadataService.getMetadataFromDB(orgID, apiID, viewName);
+
+        if (req.wantsJSON) {
+            const agentAccess = resolveAgentAccess(metaData);
+            if (agentAccess.level === AGENT_ACCESS_LEVELS.HIDDEN) {
+                return res.status(404).json({ error: 'not_found', message: 'API not found.' });
+            }
+            if (agentAccess.level === AGENT_ACCESS_LEVELS.READ_ONLY) {
+                return res.status(403).json({
+                    error: 'access_restricted',
+                    level: 'read_only',
+                    message: 'Agents cannot access the API usage workflow for this API.',
+                    reason: agentAccess.reason || null,
+                });
+            }
+        }
+
+        const workflowFile = await apiDao.getAPIFile(
+            constants.FILE_NAME.WORKFLOW_FILE_NAME,
+            constants.DOC_TYPES.WORKFLOW_DEFINITION,
+            orgID, apiID
+        );
+
+        if (!workflowFile || !workflowFile.API_FILE) {
+            if (req.wantsJSON) {
+                return res.status(404).json({ error: 'not_found', message: 'No API usage workflow found for this API.' });
+            }
+            return res.status(404).send('API usage workflow not found');
+        }
+
+        const workflowContent = workflowFile.API_FILE.toString(constants.CHARSET_UTF8);
+
+        if (req.wantsJSON) {
+            const workflow = JSON.parse(workflowContent);
+            const baseDocUrl = `/${orgName}/views/${viewName}/api/${apiHandle}`;
+            return res.json({
+                ...workflow,
+                _type: 'api_usage_workflow',
+                _hint: 'This is an API usage workflow — it describes how this API\'s own operations connect '
+                    + 'together for real-world use cases. Each workflow outlines a sequence of API calls with '
+                    + 'their required inputs, expected outputs, and success criteria. Use these as the blueprint '
+                    + 'for your integration. NOTE: This is different from the portal integration workflows '
+                    + '(discover-api, integrate-api, generate-*-key) which describe how to interact with the '
+                    + 'developer portal itself.',
+                _available_actions: [
+                    {
+                        action: 'build_integration',
+                        description: 'Use these API usage workflows as the blueprint for your integration. Build '
+                            + 'your code following the defined operation sequences with placeholder environment '
+                            + 'variables (API_BASE_URL, API_KEY). Generate credentials only after the code is written.',
+                    },
+                    {
+                        action: 'view_specification',
+                        description: 'Fetch the full API specification for detailed request/response schemas.',
+                        link: `${baseDocUrl}/docs/specification`,
+                    },
+                ],
+            });
+        }
+
+        // Non-agent: return raw JSON for now
+        res.setHeader('Content-Type', constants.MIME_TYPES.JSON);
+        return res.send(workflowContent);
+    } catch (error) {
+        logger.error("Failed to load API usage workflow", { orgName, apiHandle, error: error.message });
+        if (req.wantsJSON) {
+            return res.status(404).json({ error: 'not_found', message: 'No API usage workflow found for this API.' });
+        }
+        return res.status(404).send('Workflow not found');
+    }
+};
 
 const loadDocsPage = async (req, res) => {
 
@@ -765,6 +870,7 @@ const loadDocument = async (req, res) => {
                 templateContent.asyncapi = JSON.stringify(modifiedAsyncAPI);
             }
             templateContent.isAPIDefinition = true;
+            templateContent.hasWorkflow = definitionResponse.hasWorkflow || false;
 
             // Agent JSON fork: return raw spec instead of HTML
             if (req.wantsJSON) {
@@ -780,16 +886,56 @@ const loadDocument = async (req, res) => {
                         reason: agentAccess.reason || null,
                     });
                 }
+                // Build the agent response with raw spec
+                const agentResponse = {};
+                const { orgName: specOrgName, viewName: specViewName, apiHandle: specApiHandle } = req.params;
+                const specBaseDocUrl = `/${specOrgName}/views/${specViewName}/api/${specApiHandle}`;
+
                 if (templateContent.swagger) {
-                    return res.json(JSON.parse(templateContent.swagger));
+                    Object.assign(agentResponse, JSON.parse(templateContent.swagger));
+                } else if (templateContent.asyncapi) {
+                    Object.assign(agentResponse, JSON.parse(templateContent.asyncapi));
+                } else if (templateContent.graphql) {
+                    agentResponse.schema = definitionResponse.graphql;
+                } else {
+                    return res.status(404).json({ error: 'not_found', message: 'Specification not available for this API type.' });
                 }
-                if (templateContent.asyncapi) {
-                    return res.json(JSON.parse(templateContent.asyncapi));
+
+                agentResponse._available_actions = [];
+
+                // If API usage workflow exists, point agent to the dedicated endpoint
+                if (templateContent.hasWorkflow) {
+                    agentResponse._api_usage_workflow_available = true;
+                    agentResponse._api_usage_workflow_link = `${specBaseDocUrl}/docs/workflow`;
+                    agentResponse._available_actions.push({
+                        action: 'view_api_usage_workflow',
+                        description: 'This API has a usage workflow that describes how its operations connect '
+                            + 'together for real-world use cases — the correct sequence of API calls, required '
+                            + 'inputs/outputs between steps, and supported scenarios. This is NOT a portal '
+                            + 'integration workflow — it describes the target API\'s own operation sequences.',
+                        link: `${specBaseDocUrl}/docs/workflow`,
+                    });
                 }
-                if (templateContent.graphql) {
-                    return res.json({ schema: definitionResponse.graphql });
-                }
-                return res.status(404).json({ error: 'not_found', message: 'Specification not available for this API type.' });
+
+                agentResponse._available_actions.push(
+                    {
+                        action: 'build_integration',
+                        description: templateContent.hasWorkflow
+                            ? 'IMPORTANT: Before building your integration, fetch the API usage workflow first '
+                                + '(see view_api_usage_workflow action above). The usage workflow defines the correct '
+                                + 'sequence of API calls for each use case — use it as the blueprint for your code. '
+                                + 'Use placeholder environment variables (API_BASE_URL, API_KEY). Generate credentials '
+                                + 'only after the code is written.'
+                            : 'Build integration code using this specification with placeholder environment '
+                                + 'variables (API_BASE_URL, API_KEY). Generate credentials only after the code is written.',
+                    },
+                    {
+                        action: 'subscribe',
+                        description: 'Subscribe to this API to get access credentials for calling it.',
+                    },
+                );
+
+                return res.json(agentResponse);
             }
         }
         if (config.mode === constants.DEV_MODE) {
@@ -1095,4 +1241,5 @@ module.exports = {
     loadAPIContent,
     loadDocsPage,
     loadDocument,
+    loadWorkflow,
 };

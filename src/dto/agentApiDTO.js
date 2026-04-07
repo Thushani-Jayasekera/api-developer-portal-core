@@ -34,7 +34,6 @@
 
 const AGENT_ACCESS_LEVELS = {
     FULL: 'full',
-    READ_ONLY: 'read_only',
     HUMAN_APPROVAL: 'human_approval',
     HIDDEN: 'hidden',
 };
@@ -43,7 +42,6 @@ const AGENT_ACCESS_LEVELS = {
 // endpoints, llms.txt, and anywhere else that needs to explain levels to agents or humans.
 const AGENT_ACCESS_LEVEL_DESCRIPTIONS = {
     [AGENT_ACCESS_LEVELS.FULL]: 'Agents can discover and use this API freely.',
-    [AGENT_ACCESS_LEVELS.READ_ONLY]: 'Agents can read docs and spec but cannot subscribe or call.',
     [AGENT_ACCESS_LEVELS.HUMAN_APPROVAL]: 'This API requires a human in the loop. Agents can discover and read its documentation, but must pause and get explicit consent from their human operator before subscribing or invoking.',
     [AGENT_ACCESS_LEVELS.HIDDEN]: 'Not visible to agents.',
 };
@@ -122,7 +120,7 @@ const toAgentApiSummary = (apiMetadata, baseUrl) => {
 /**
  * Shapes a single API entry for the agent API detail response.
  */
-const toAgentApiDetail = (apiMetadata, scopes, baseUrl, host) => {
+const toAgentApiDetail = (apiMetadata, scopes, baseUrl, host, hasWorkflow = false) => {
     const agentAccess = resolveAgentAccess(apiMetadata);
     const handle = apiMetadata.apiHandle;
     const isMCP = apiMetadata.apiInfo?.apiType === 'MCP';
@@ -169,6 +167,29 @@ const toAgentApiDetail = (apiMetadata, scopes, baseUrl, host) => {
         self: `${baseUrl}/${apiPathSegment}/${handle}`,
         specification: `${baseUrl}/${apiPathSegment}/${handle}/docs/specification`,
     };
+
+    if (hasWorkflow) {
+        detail.links.api_usage_workflow = `${baseUrl}/${apiPathSegment}/${handle}/docs/workflow`;
+        detail.has_api_usage_workflow = true;
+    }
+
+    detail._available_actions = [
+        {
+            action: 'view_specification',
+            description: 'Fetch the full API specification (OpenAPI/AsyncAPI/GraphQL) via the specification link.',
+        },
+    ];
+
+    if (hasWorkflow) {
+        detail._available_actions.push({
+            action: 'view_api_usage_workflow',
+            description: 'This API has a usage workflow describing how its operations connect together for '
+                + 'real-world use cases — the correct sequence of API calls, required inputs/outputs between '
+                + 'steps, and supported scenarios. This is different from the portal integration workflows. '
+                + 'Fetch it before building your integration.',
+            link: detail.links.api_usage_workflow,
+        });
+    }
 
     if (host) {
         detail._discovery = buildDiscovery(host, baseUrl);

@@ -573,6 +573,11 @@ passport.deserializeUser(async (sessionData, done) => {
 app.use(constants.ROUTE.TECHNICAL_STYLES, express.static(path.join(require.main.filename, '../styles')));
 app.use(constants.ROUTE.TECHNICAL_SCRIPTS, express.static(path.join(require.main.filename, '../scripts')));
 
+// ─── Arazzo workflow files ────────────────────────────────────────────────────
+// Serves the /workflows directory so agents can fetch the Arazzo spec directly.
+// e.g. GET /workflows/integrate-api.arazzo.yaml
+app.use('/workflows', express.static(path.join(process.cwd(), 'workflows')));
+
 // ─── Shared helpers for agent.json responses ─────────────────────────────────
 
 /**
@@ -593,79 +598,21 @@ function buildAgentAuthSection() {
                 agent_instructions: 'Ask the user to provide their API key, then include it in the request header specified in the "header" field.',
             },
         ],
-        hint: 'Read-only discovery requires no authentication. To subscribe to APIs or generate keys, authenticate as a user via Bearer token.',
+        hint: 'Read-only discovery requires no authentication. To subscribe to APIs or generate keys, authenticate as a user via Bearer token. Use the token_retrieval_flow in the bearer scheme — do not ask the user to manually locate or copy their token.',
     };
 }
 
 
 // ─── llms.txt — entry point for LLM/agent crawlers ──────────────────────────
 // Served at both the well-known path and the root (both conventions are in use).
-// This is the single entry point for agents — replaces a separate global agent.json.
-// Agents read this to understand the portal, find the org name, and get to the
-// per-org manifest which has concrete URLs and the full integration guide.
+// Source of truth: /llms.txt in the project root. Edit that file — do not add
+// content here. The handler reads the file and substitutes {host} at request time.
+const llmsTxtTemplate = fs.readFileSync(path.join(process.cwd(), 'llms.txt'), 'utf8');
+
 const llmsTxt = (req, res) => {
     const host = req.protocol + '://' + req.get('host');
-    res.type('text/plain').send(`# API Developer Portal
-
-> A developer portal for discovering, subscribing to, and integrating with APIs programmatically.
-> Agents can browse the full API catalog, fetch OpenAPI/AsyncAPI specifications, and manage
-> subscriptions without scraping HTML — use Accept: application/json on any portal URL.
-
-## Getting Started
-
-The portal is organised by organisation (org). Each org has its own API catalog.
-To get started, you need to know the org name — then fetch its discovery document.
-
-### Step 1 — Find the org name
-
-If the user mentioned an org name explicitly (e.g. "use the acme org") or gave you a
-portal URL (e.g. ${host}/acme/views/default/apis), extract the org name from that.
-The org name is the first path segment after the portal host.
-Only ask the user for the org name if it is genuinely unknown from context.
-
-### Step 2 — Fetch the per-org discovery document
-
-  ${host}/{orgName}/agent.json
-  (replace {orgName} with the org name you found in step 1)
-
-This returns:
-- Concrete, ready-to-call URLs for all capabilities (no further substitution needed)
-- A full integration_guide walking through discovery → access check → subscribe → keys → integrate
-
-## API Catalog
-
-List all APIs for an organisation (JSON):
-  ${host}/{orgName}/views/{viewName}/apis
-  ${host}/{orgName}/views/{viewName}/apis?query=payment   (keyword search)
-  Accept: application/json
-
-Get a single API with agent access level, endpoints, and subscription plans (JSON):
-  ${host}/{orgName}/views/{viewName}/api/{apiHandle}
-  Accept: application/json
-
-Fetch raw OpenAPI / AsyncAPI / GraphQL spec (JSON):
-  ${host}/{orgName}/views/{viewName}/api/{apiHandle}/docs/specification
-  Accept: application/json
-
-## MCP Servers
-
-List available MCP servers (JSON):
-  ${host}/{orgName}/views/{viewName}/mcps
-  Accept: application/json
-
-## Agent Access Levels
-
-Each API declares an agent_access level in its JSON response:
-  full            — agent can discover, read, subscribe, and invoke freely
-  read_only       — agent can discover and read documentation; subscription and invocation blocked
-  human_approval  — agent must pause and get explicit consent from its human operator before proceeding
-  hidden          — not visible to agents at all
-
-## Authentication
-
-Some capabilities require a bearer token. The per-org discovery document (step 2 above)
-includes the full authentication section explaining how to obtain credentials.
-`);
+    const content = llmsTxtTemplate.replace(/\{host\}/g, host);
+    res.type('text/plain').send(content);
 };
 
 app.get('/llms.txt', llmsTxt);
@@ -726,6 +673,9 @@ app.get('/:orgName/agent.json', async (req, res) => {
             views,
             default_view: defaultView,
 
+            important: 'All REST API requests MUST include the header Accept: application/json.' +
+                'Without it, the portal returns HTML pages instead of machine-readable JSON.',
+
             authentication: buildAgentAuthSection(),
 
             // Concrete, ready-to-call URLs — no placeholders to resolve
@@ -738,8 +688,7 @@ app.get('/:orgName/agent.json', async (req, res) => {
                     urls: views.map(v => `${host}/${orgName}/views/${v}/apis`),
                     default_url: `${host}/${orgName}/views/${defaultView}/apis`,
                     query_params: {
-                        query: 'Keyword search across API names, descriptions, and tags. Example: ?query=payment',
-                        tags: 'Filter by tag. Example: ?tags=finance',
+                        query: 'Keyword search across API names. Example: ?query=payment',
                     },
                 },
                 {
@@ -756,6 +705,7 @@ app.get('/:orgName/agent.json', async (req, res) => {
                     auth_required: false,
                     accept: 'application/json',
                     url_pattern: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}`,
+                    agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
                 },
                 {
                     name: 'api_specification',
@@ -765,132 +715,104 @@ app.get('/:orgName/agent.json', async (req, res) => {
                     url_pattern: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}/docs/specification`,
                 },
                 {
+                    name: 'api_usage_workflow',
+                    description: 'Get the API usage workflow for a specific API. These describe how the API\'s own '
+                        + 'operations connect together for real-world use cases — the correct sequence of API calls, '
+                        + 'required inputs/outputs between steps, and supported scenarios. Not all APIs have these — '
+                        + 'check for has_api_usage_workflow or links.api_usage_workflow in the API detail response. '
+                        + 'NOTE: These are different from the portal integration workflows (discover-api, '
+                        + 'integrate-api, generate-*-key) which describe how to interact with the portal itself.',
+                    auth_required: false,
+                    accept: 'application/json',
+                    url_pattern: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}/docs/workflow`,
+                },
+                {
                     name: 'application_management',
-                    description: 'Create and manage applications. Required before subscribing to APIs.',
+                    description: 'Create and manage applications. Required before subscribing to APIs.'
+                        + 'This is optional for APIs with gateway vendor set to ' + PLATFORM_GATEWAY,
                     auth_required: true,
                     auth_schemes: ['bearer'],
+                    accept: 'application/json',
                     url: `${host}/devportal/organizations/${orgID}/applications`,
                 },
                 {
                     name: 'subscription_management',
-                    description: 'Subscribe an application to an API under a chosen plan.',
+                    description: 'Subscribe an application to an API under a chosen plan.' +
+                        +'This is optional for APIs with gateway vendor set to ' + PLATFORM_GATEWAY,
                     auth_required: true,
                     auth_schemes: ['bearer'],
+                    accept: 'application/json',
                     url: `${host}/devportal/organizations/${orgID}/subscriptions`,
                 },
                 {
-                    name: 'key_generation',
-                    description: 'Generate, regenerate, or revoke API keys.',
+                    name: 'api_key_generation',
+                    description: 'Generate, regenerate, or revoke API keys for APIs with gateway vendor'
+                        + PLATFORM_GATEWAY,
                     auth_required: true,
                     auth_schemes: ['bearer'],
+                    accept: 'application/json',
                     url: `${host}/devportal/organizations/${orgID}/platform-api-keys/generate`,
+                },
+                {
+                    name: 'oauth2_key_generation',
+                    description: 'Generate client ID and secret for the created application.',
+                    auth_required: true,
+                    auth_schemes: ['bearer'],
+                    accept: 'application/json',
+                    url: `${host}/devportal/organizations/${orgID}/oauth2/generate`,
                 },
             ],
 
-            agent_access_levels: AGENT_ACCESS_LEVEL_DESCRIPTIONS,
-
-            // Step-by-step integration guide for agents tasked with "find an API and build an integration".
-            // All URLs in this section are ready to call — no placeholders to resolve.
-            integration_guide: {
-                overview: 'Follow these steps in order to find an API and integrate it into your software.',
-                steps: [
+            // Arazzo workflows — machine-readable step-by-step integration logic.
+            // Each workflow lives in its own file. Fetch only what you need.
+            // IMPORTANT: After discovery, build your integration code FIRST using the spec
+            // with placeholder env vars. Only then fetch the credential workflow.
+            workflows: {
+                orchestrator_url: `${host}/workflows/integrate-api.arazzo.yaml`,
+                portal_host: host,
+                note: 'Each workflow is a separate file. Fetch only the file matching your current phase to keep payloads small.',
+                phases: [
                     {
-                        step: 1,
-                        action: 'discover',
-                        instruction: 'Fetch the API catalog. Use ?query= to search by keyword rather than loading everything.',
-                        url: `${host}/${orgName}/views/${defaultView}/apis`,
-                        example: `${host}/${orgName}/views/${defaultView}/apis?query=payment`,
-                        accept: 'application/json',
+                        phase: 1,
+                        name: 'discovery',
+                        file: `${host}/workflows/discover-api.arazzo.yaml`,
+                        workflowId: 'discover-api',
+                        summary: 'Search the catalog, evaluate candidates, and recommend the best API.',
+                        auth_required: false,
+                        use_when: 'Always — this is the first step.',
                     },
                     {
-                        step: 2,
-                        action: 'check_access',
-                        instruction: 'Before going further with any API, read its agent_access.level. This determines whether you can proceed autonomously.',
-                        rules: {
-                            full: 'Proceed autonomously.',
-                            read_only: 'You can read the spec but cannot subscribe or call this API. Pick a different one.',
-                            human_approval: 'STOP. Tell your human operator which API you found and why you want to use it. Do not subscribe or invoke until they confirm.',
-                            hidden: 'This API will not appear in results — no action needed.',
-                        },
+                        phase: 2,
+                        name: 'build_integration',
+                        file: null,
+                        workflowId: null,
+                        summary: 'Build your integration code using the API spec from Phase 1. Use placeholder env vars (API_BASE_URL, API_KEY). Use sandbox endpoint if available.',
+                        auth_required: false,
+                        use_when: 'Always — immediately after discovery, BEFORE credential generation.',
                     },
                     {
-                        step: 3,
-                        action: 'evaluate_and_plan',
-                        instruction: 'Fetch the API detail and its spec. Read the spec thoroughly — understand the endpoints, required inputs, response shapes, and authentication scheme before committing to a subscription. Use this step to plan your integration: which endpoints you will call, in what order, and with what payloads. Do not subscribe until you are confident this API meets your needs.',
-                        api_detail_url: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}`,
-                        api_spec_url: `${host}/${orgName}/views/${defaultView}/api/{apiHandle}/docs/specification`,
-                        accept: 'application/json',
-                    },
-                    {
-                        step: 4,
-                        action: 'authenticate',
-                        instruction: 'Subscribing and generating keys requires a bearer token. Check whether you already have one from the user. If not, ask the user to provide their portal bearer token before proceeding — do not attempt steps 5 or 6 without it.',
+                        phase: 3,
+                        name: 'generate_credentials',
+                        summary: 'Generate credentials. Fetch ONLY the file matching gateway_vendor and securityScheme.',
                         auth_required: true,
-                        token_source: 'Ask the user. The token is a user-scoped bearer token for this portal, not an API key.',
-                        how_to_use: 'Include it as: Authorization: Bearer <token>',
-                    },
-                    {
-                        step: 5,
-                        action: 'subscribe',
-                        condition: 'Check subscription_required in the API detail response from step 3. If false (gateway_vendor is "wso2/api-platform"), skip this step entirely and go to step 6.',
-                        instruction: 'Create an application, then subscribe it to the API under a plan listed in the API detail response.',
-                        auth_required: true,
-                        create_application_url: `${host}/devportal/organizations/${orgID}/applications`,
-                        subscribe_url: `${host}/devportal/organizations/${orgID}/subscriptions`,
-                        note: 'If an application already exists for this user, reuse it — check for a 409 conflict and list existing applications instead of creating a new one.',
-                    },
-                    {
-                        step: 6,
-                        action: 'generate_credentials',
-                        instruction: 'How you generate credentials depends on two things: the gateway_vendor from step 3 and the securitySchemes in the API spec from step 3. Follow the matching path below.',
-                        auth_required: true,
-                        by_gateway: {
-                            'wso2/api-platform': {
-                                instruction: 'This gateway does not require a subscription. Generate a platform API key directly.',
-                                url: `${host}/devportal/organizations/${orgID}/platform-api-keys/generate`,
-                                credential_type: 'api_key',
-                                usage: 'Pass the returned key in the header specified in the spec\'s securitySchemes.',
+                        use_when: 'After integration code is built. Requires bearer token.',
+                        options: [
+                            {
+                                file: `${host}/workflows/generate-wso2-key.arazzo.yaml`,
+                                workflowId: 'generate-wso2-platform-api-key',
+                                use_when: 'gateway_vendor == "wso2/api-platform" and securityScheme is api_key.',
                             },
-                            other: {
-                                instruction: 'Read the securitySchemes from the spec fetched in step 3 and follow the matching path.',
-                                by_security_scheme: {
-                                    api_key: {
-                                        instruction: 'Generate an API key for your subscribed application.',
-                                        url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/api-keys/generate`,
-                                        credential_type: 'api_key',
-                                        usage: 'Pass the returned key in the header specified in the spec\'s securitySchemes (typically an apiKey header).',
-                                    },
-                                    oauth2: {
-                                        instruction: 'Generate OAuth2 client credentials for your subscribed application, then use them to obtain an access token.',
-                                        step_a: {
-                                            action: 'generate_client_credentials',
-                                            instruction: 'Generate OAuth2 keys for your application. The response contains client_id, client_secret, and keyMappingId.',
-                                            url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/generate-keys`,
-                                        },
-                                        step_b: {
-                                            action: 'generate_access_token',
-                                            instruction: 'Use the client_id and client_secret from step_a to request an access token from the token endpoint declared in the spec\'s OAuth2 flow.',
-                                            url: `${host}/devportal/organizations/${orgID}/applications/{applicationId}/oauth-keys/{keyMappingId}/generate-token`,
-                                            token_request: 'POST to the token URL with grant_type=client_credentials. Include client_id and client_secret as a base64-encoded Basic auth header or as form fields, depending on the spec.',
-                                        },
-                                        credential_type: 'bearer_token',
-                                        usage: 'Pass the access token as: Authorization: Bearer <access_token>',
-                                        token_expiry: 'Access tokens expire. Re-request a token using the same client credentials when you receive a 401 response.',
-                                    },
-                                },
+                            {
+                                file: `${host}/workflows/generate-cloud-api-key.arazzo.yaml`,
+                                workflowId: 'generate-cloud-gateway-api-key',
+                                use_when: 'gateway_vendor is NOT "wso2/api-platform" and securityScheme is api_key.',
                             },
-                        },
-                    },
-                    {
-                        step: 7,
-                        action: 'integrate',
-                        instruction: 'You now have everything: the API spec from step 3 and credentials from step 6. Before making any API calls, set your base URL environment variable using the recommended_base_url field from the API detail response. This field automatically selects the sandbox endpoint when available (preferred for development and testing) or falls back to the production endpoint. Use this as your API_BASE_URL. Then implement the integration using the spec as your reference. Use the API credential — not the portal bearer token from step 4 — for all API calls.',
-                        base_url_selection: {
-                            field: 'recommended_base_url',
-                            logic: 'If the API provides a sandbox endpoint, it is used as the recommended base URL. Otherwise, the production endpoint is used.',
-                            env_variable: 'API_BASE_URL',
-                            note: 'Always use the recommended_base_url from the API response rather than hardcoding endpoints.',
-                        },
+                            {
+                                file: `${host}/workflows/generate-oauth2-credentials.arazzo.yaml`,
+                                workflowId: 'generate-oauth2-credentials',
+                                use_when: 'gateway_vendor is NOT "wso2/api-platform" and securityScheme is oauth2.',
+                            },
+                        ],
                     },
                 ],
             },

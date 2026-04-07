@@ -59,6 +59,7 @@ module.exports = {
         API_DEFINITION: 'API_DEFINITION',
         SCHEMA_DEFINITION: 'SCHEMA_DEFINITION',
         IMAGES: 'IMAGE',
+        WORKFLOW_DEFINITION: 'WORKFLOW_DEFINITION',
         DOCUMENT: 'DOCUMENT',
         LINK: "DOC_LINK",
         DOCS: {
@@ -170,6 +171,7 @@ module.exports = {
         API_SPECIFICATION_PATH: 'specification',
         API_DEFINITION_GRAPHQL: 'apiDefinition.graphql',
         API_DEFINITION_XML: 'apiDefinition.xml',
+        WORKFLOW_FILE_NAME: 'workflow.json',
     },
     DEFAULT_SUBSCRIPTION_PLANS: [
         {
