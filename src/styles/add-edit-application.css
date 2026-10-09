@@ -1,9 +1,21 @@
+/* The token layer, imported so this sheet stands alone. Internal pages render
+   inside the organization's own stored layout, which predates the tokens.css
+   <link> and will never gain it - so the sheet has to carry its own tokens.
+   /technical-styles/ is never rewritten to a stored-asset URL. */
+@import "/technical-styles/tokens.css";
+/* The component layer, imported for the same reason as the tokens above: a stored
+   layout links neither, so any page that renders inside one gets the shared vocabulary -
+   dp-btn, dp-modal, dp-note, sub-status-pill, dp-empty - only if the sheet it does load
+   brings it along. Without this, every one of those classes is undefined on an
+   organization with a stored theme, and buttons and dialogs render unstyled.
+   No cascade risk: components.css and the themable main.css share no selector. */
+@import "/technical-styles/components.css";
 .form-card {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border-colour-secondary);
   border-radius: 12px;
-  background-color: var(--secondary-bg-color);
+  background-color: var(--surface-sunken);
   padding: 20px;
   height: 100%;
   box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
@@ -21,14 +33,14 @@
 
 .form-label {
   font-size: 875rem;
-  color: var(--main-text-color);
+  color: var(--ink);
   margin: 5px 0;
 }
 
 .form-control,
 .form-select {
   font-size: 1rem;
-  color: var(--main-text-color);
+  color: var(--ink);
   text-decoration: none;
   font-weight: 500;
   overflow: hidden;
@@ -36,7 +48,7 @@
 
 .form-control::placeholder {
   opacity: 0.6;
-  color: var(--main-text-color);
+  color: var(--ink);
 }
 
 .form-control:focus {
@@ -50,7 +62,7 @@
 
 /* Create application form wrapper class for controlling text size */
 .create-app-form {
-  color: var(--main-text-color);
+  color: var(--ink);
   text-decoration: none;
   font-size: 1rem;
   font-weight: 500;

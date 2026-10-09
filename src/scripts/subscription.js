@@ -380,9 +380,20 @@ async function subscribe(orgID, applicationID, apiId, apiReferenceID, policyId, 
       resetUi();
 
       if (response.ok) {
-        showSubscriptionMessage(messageOverlay, "Successfully subscribed", "success");
         closeModal('planModal-' + apiId);
-        markSubscribedUI(card, applicationID, apiId);
+        /* No reload. markSubscribedUI reaches the state a reload would render - the
+           ribbon, the tint, "View subscription" on this card, and the one-plan-per-
+           application rule applied to every sibling card - so navigating away only cost
+           the user their scroll position and a white flash. The earlier note here claimed
+           only the server knew which plans an application now holds; it does not, because
+           the rule is local: this application has just taken this plan, so on every other
+           plan of this API it is spoken for.
+
+           The paid flow still returns through a page load, which is why the ?subscription
+           =success handler at the top of this file stays. */
+        markSubscribedUI(card, applicationID, apiId, policyName);
+        showAlert('Subscribed successfully!', 'success');
+        return;
       } else {
         console.error("Failed to create subscription:", responseData);
         const errMsg = responseData.message || responseData.description || responseData.error || "Subscription failed. Please try again.";
@@ -801,6 +812,23 @@ function addAPISubscription(selectElement) {
 
 }
 
+/**
+ * Swaps a table out for its empty state once the last row has gone.
+ *
+ * The proxy and MCP tables are each gated on their own count now, so either can be
+ * absent - an application subscribed only to MCP servers renders no proxy table, and
+ * reading .rows off it threw. It also takes the .sub-tablewrap with it rather than just
+ * the <table>, which would otherwise leave its border behind as an empty frame above
+ * the empty state.
+ */
+function collapseEmptyTable(tableId, emptyStateId) {
+    const table = document.getElementById(tableId);
+    if (!table || table.rows.length > 1) return;
+    (table.closest('.sub-tablewrap') || table).remove();
+    const emptyState = document.getElementById(emptyStateId);
+    if (emptyState) emptyState.style.display = 'block';
+}
+
 async function removeSubscription(orgID, appID, apiRefID, subID) {
 
     try {
@@ -813,16 +841,8 @@ async function removeSubscription(orgID, appID, apiRefID, subID) {
         if (response.ok) {
             await showAlert(`Unsubscribed successfully!`, 'success');
             document.getElementById(`data-row-${subID}`)?.remove();
-            const rowCount = document.getElementById(`app-table-${appID}`).rows.length;
-            if (rowCount === 1) {
-                document.getElementById(`app-table-${appID}`).remove();
-                document.getElementById('no-subscription').style.display = 'block';
-            }
-            const mcpTable = document.getElementById(`app-table-mcp-${appID}`);
-            if (mcpTable && mcpTable.rows.length === 1) {
-                mcpTable.remove();
-                document.getElementById('no-subscription-mcp').style.display = 'block';
-            }
+            collapseEmptyTable(`app-table-${appID}`, 'no-subscription');
+            collapseEmptyTable(`app-table-mcp-${appID}`, 'no-subscription-mcp');
         } else {
             const responseData = await response.json();
             console.error('Failed to unsubscribe:', responseData);
@@ -864,7 +884,10 @@ function openDeleteModal(subID, orgID, appID, apiRefID) {
     bootstrapModal.show();
 }
 
-function markSubscribedUI(card, applicationID, apiId) {
+/* planName is what the sibling rows have to name once this application is spoken for. It
+   is optional so the older callers keep working; without it the row is still disabled,
+   just without the badge the server render carries. */
+function markSubscribedUI(card, applicationID, apiId, planName) {
   if (!card) return;
 
   const subscriptionFlag = card.querySelector(".subscription-flag");
@@ -878,34 +901,118 @@ function markSubscribedUI(card, applicationID, apiId) {
     }
   }
 
-  // Scope dropdown marking to both modal and card containers (like upstream)
+  /* Scope dropdown marking to a container that holds every plan of this one API. The plan
+     dialog and the listing card are both such a container, as upstream has it.
+
+     The API landing page is neither: its plan cards are siblings in the page, so this fell
+     through to `card` alone and no sibling card ever learned the application was spoken
+     for. That is what actually forced the reload there - not, as the note at the call site
+     used to claim, the server being the only thing that knew. #subscriptionPlans is the
+     section those cards live in, and it is already scoped to the API being viewed. */
   var apiContainer = apiId
     ? (document.getElementById('planModal-' + apiId) || document.getElementById('apiCard-' + apiId))
     : null;
+  if (!apiContainer) apiContainer = card.closest('#subscriptionPlans');
   var allDropdowns = apiContainer
     ? apiContainer.querySelectorAll('.custom-dropdown')
     : card.querySelectorAll('.custom-dropdown');
 
+  /* An application holds at most one plan per API, so the plan just subscribed and the
+     other plans of the same API need opposite treatment. Without the else branch the
+     application stayed selectable on its sibling cards until the next page load, and
+     picking it there produced a 409 from adminService.createSubscription. */
   allDropdowns.forEach(function(dropdown) {
     const appOption = dropdown.querySelector('.select-item[data-value="' + applicationID + '"]');
-    if (appOption) {
+    if (!appOption) return;
+
+    if (card.contains(dropdown)) {
       let subscriptionIcon = appOption.querySelector(".subscription-icon");
       if (subscriptionIcon) {
         subscriptionIcon.style.display = "inline-block";
       } else {
-        const subscriptionIconHtml = '<img src="https://raw.githubusercontent.com/wso2/docs-bijira/refs/heads/main/en/devportal-theming/success-rounded.svg"'
-          + ' alt="Subscribed" class="subscription-icon" style="display: inline-block;" />';
-        const tempDiv = document.createElement("div");
-        tempDiv.innerHTML = subscriptionIconHtml;
-        subscriptionIcon = tempDiv.firstElementChild;
+        // Same local asset the server render uses; this used to reach out to
+        // raw.githubusercontent.com for an icon the portal already ships.
+        subscriptionIcon = document.createElement("img");
+        subscriptionIcon.src = "/images/success-rounded.svg";
+        subscriptionIcon.alt = "Subscribed";
+        subscriptionIcon.className = "subscription-icon";
+        subscriptionIcon.style.cssText = "display: inline-block; width: 18px; height: 18px; flex-shrink: 0;";
         appOption.appendChild(subscriptionIcon);
       }
-      appOption.classList.add("disabled");
+      /* The option stays selectable on its own plan - it is the way back to the
+         subscription. Marking it is what turns the control below into "View
+         subscription"; disabling it, as this did before, just made the application
+         unreachable. */
+      appOption.dataset.subscribed = "true";
+      const container = appOption.closest(".subscription-container");
+      const selectedId = container && container.querySelector('input[type="hidden"]');
+      if (container && selectedId && selectedId.value === applicationID) {
+        container.classList.add("subscription-container--selected-subscribed");
+      }
+      return;
+    }
+
+    // Another plan of this API: the application is now spoken for.
+    appOption.classList.add("disabled");
+    appOption.setAttribute("aria-disabled", "true");
+    appOption.dataset.subscribed = "false";
+
+    /* Say which plan holds it, as the server render does. Without this the row went grey
+       with no reason given, and the only way to learn why was to reload. */
+    if (planName) {
+      const appName = appOption.dataset.appName || "This application";
+      appOption.title = appName + " is already subscribed to this API on the " + planName
+        + " plan. Change that subscription's plan, or use a different application.";
+      const label = appOption.querySelector(".d-flex.flex-column");
+      if (label && !label.querySelector(".plan-held-badge")) {
+        const small = document.createElement("small");
+        small.className = "plan-held-badge";
+        small.style.cssText = "font-size: 11px; margin-top: 3px;";
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.style.cssText = "background-color: #e0f2fe; color: #0369a1; padding: 2px 8px;"
+          + " border-radius: 10px; font-weight: 600; font-size: 10px;";
+        badge.textContent = "On " + planName;
+        small.appendChild(badge);
+        label.appendChild(small);
+      }
+    }
+
+    /* Clear it where it was the pending choice, so that card cannot submit a selection
+       the server would now refuse. Reached when an application is picked on one plan and
+       then subscribed on another before this card is touched again. */
+    const siblingHidden = dropdown.querySelector('input[type="hidden"]');
+    if (siblingHidden && siblingHidden.value === applicationID) {
+      siblingHidden.value = "";
+      const label = dropdown.querySelector(".selected-text");
+      if (label) label.textContent = "Create an app";
+      const siblingCard = dropdown.closest(".subscription-card") || dropdown.closest(".aov-plan-card");
+      const siblingBtn = siblingCard && siblingCard.querySelector(".subscribe-btn");
+      if (siblingBtn) siblingBtn.setAttribute("disabled", "disabled");
     }
   });
 
-  const btn = card.querySelector(".common-btn-primary");
-  if (btn) btn.setAttribute("disabled", "disabled");
+  /* The card's Subscribe control is NOT disabled here. Which of the two controls shows is
+     decided by the selected application (syncSubscribeControl toggles
+     .subscription-container--selected-subscribed), and a plan may be held by several
+     applications - so after one subscribes, Subscribe has to stay usable for the next one.
+     Disabling it here only appeared harmless because the landing card's control is an <a>,
+     where the attribute is inert, and because the next selection change happened to strip
+     it again; on the <button> the plan dialog renders it blocked the second subscribe
+     outright until a reload. */
+
+  /* Subscribing on the API page never reloads, so the card has to reach the state a
+     reload would render: the ribbon, the green tint and the "View subscription" control.
+     `card` is whatever getSubscriptionCard returned, and on this page that is the grid
+     column carrying id="subscriptionCard-<policy>" - the plan card is its child. Testing
+     `card` itself for the class, as this did, was therefore never true here, so the tint
+     and ribbon only appeared on the next page load. */
+  const planCard = card.classList.contains("aov-plan-card")
+    ? card
+    : card.querySelector(".aov-plan-card");
+  if (planCard) {
+    planCard.classList.add("aov-plan-card--subscribed");
+  }
 }
 
 /**

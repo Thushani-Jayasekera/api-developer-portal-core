@@ -897,12 +897,42 @@ const createSubscription = async (req, res) => {
                 sharedApp = await adminDao.getApplicationKeyMapping(orgID, req.body.applicationID, true);
                 nonSharedApp = await adminDao.getApplicationKeyMapping(orgID, req.body.applicationID, false);
 
+                /* One application holds at most one plan per API. DP_API_SUBSCRIPTION is
+                   keyed on (APP_ID, ORG_ID, API_ID, POLICY_ID), so the table would happily
+                   take a second row on a different plan - the rule has to be enforced here.
+                   The plan cards already disable an application that is spoken for, so
+                   reaching this means a stale page or a direct call; either way the answer
+                   is to change the existing subscription's plan, not to add another.
+
+                   Cancelled subscriptions do not count, matching what the plan cards show. */
+                const apiSubscriptions = await adminDao.getAppApiSubscription(
+                    orgID,
+                    req.body.applicationID,
+                    req.body.apiId,
+                );
+                const conflicting = (apiSubscriptions || []).find((s) => {
+                    const ps = s.PAYMENT_STATUS;
+                    const live = !ps || ps === 'ACTIVE';
+                    return live && s.POLICY_ID !== req.body.policyId;
+                });
+                if (conflicting) {
+                    logger.warn('Rejected a second plan for an application already subscribed to this API', {
+                        orgId: orgID,
+                        appId: req.body.applicationID,
+                        apiId: req.body.apiId,
+                        requestedPolicyId: req.body.policyId,
+                        existingPolicyId: conflicting.POLICY_ID,
+                    });
+                    return res.status(409).json({
+                        code: 409,
+                        message: 'Application already subscribed to this API',
+                        description: 'This application already holds another plan of this API. '
+                            + 'Change that subscription\'s plan, or use a different application.',
+                    });
+                }
+
                 const billingMetadata = await (async () => {
-                    const subscription = await adminDao.getAppApiSubscription(
-                        orgID,
-                        req.body.applicationID,
-                        req.body.apiId,
-                    );
+                    const subscription = apiSubscriptions;
                     return subscription?.length > 0 &&
                         (subscription[0].BILLING_CUSTOMER_ID ||
                             subscription[0].BILLING_SUBSCRIPTION_ID)
@@ -1439,7 +1469,21 @@ async function generateOAuthKey(req, cpAppID, tokenDetails) {
                     cpAppID
                 });
                 const response = await invokeApiRequest(req, 'GET', `${controlPlaneUrl}/applications/${cpAppID}/keys`, {});
-                return response.list[0];
+                // Prefer the key for the requested type; fall back to the first key as before.
+                const keys = response.list || [];
+                const sameText = (a, b) => typeof a === 'string' && typeof b === 'string'
+                    && a.toLowerCase() === b.toLowerCase();
+                const existingKey =
+                    keys.find(key => sameText(key.keyType, tokenDetails.keyType)
+                        && (!tokenDetails.keyManager || sameText(key.keyManager, tokenDetails.keyManager)))
+                    ?? keys.find(key => sameText(key.keyType, tokenDetails.keyType));
+                if (!existingKey) {
+                    logger.warn('Existing OAuth key not found for the requested key type, returning the first key', {
+                        cpAppID, keyType: tokenDetails.keyType, keyManager: tokenDetails.keyManager
+                    });
+                    return keys[0];
+                }
+                return existingKey;
             } else {
                 throw error;
             }
@@ -1602,16 +1646,28 @@ const createAppKeyMappingOnBehalfOfUser = async (cpAppID, keymanager, clientId, 
     }
 }
 
+// Union of both environments, used only to validate a key manager name.
 const getAPIMKeyManagersBehalfOfUser = async (cpOrgId, patToken) => {
 
-    let headers = {
+    const headers = {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${patToken}`
     }
-    let url = `${controlPlaneGwUrl}/key-managers?devPortalAppEnv=prod`;
-    const keymanagersResponse = await util.apiRequest('GET', url, headers, null, cpOrgId);
-
-    return keymanagersResponse.data.list;
+    const requestFor = (devPortalAppEnv) => util.apiRequest(
+        'GET', `${controlPlaneGwUrl}/key-managers?devPortalAppEnv=${devPortalAppEnv}`, headers, null, cpOrgId
+    );
+    const [prodResponse, sandboxResponse] = await Promise.allSettled([
+        requestFor(constants.DEV_PORTAL_APP_ENV.PROD),
+        requestFor(constants.DEV_PORTAL_APP_ENV.SANDBOX)
+    ]);
+    if (prodResponse.status === 'rejected' && sandboxResponse.status === 'rejected') {
+        throw prodResponse.reason;
+    }
+    const keyManagers = [
+        ...(prodResponse.value?.data?.list || []),
+        ...(sandboxResponse.value?.data?.list || [])
+    ];
+    return [...new Map(keyManagers.map(keyManager => [keyManager.name, keyManager])).values()];
 }
 
 const createCPApplication = async (req, cpApplicationName) => {

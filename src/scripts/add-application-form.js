@@ -1,8 +1,8 @@
 //DOM References
-const plusCard = document.getElementById('applicationCreateCard');
-const formView = document.getElementById('applicationCreateForm');
-const wrapper = document.getElementById('createApplicationCardWrapper');
+const createModal = document.getElementById('app-create-modal');
+const createModalClose = document.getElementById('app-create-close');
 const createButton = document.getElementById('createButton');
+const createButtonEmpty = document.getElementById('createButtonEmpty');
 const remainingCharactersSpan = document.getElementById('remainingCharacters');
 const nameError = document.getElementById('nameError');
 const descriptionError = document.getElementById('descriptionError');
@@ -10,44 +10,44 @@ const saveButton = document.getElementById('createAppButton');
 const cancelButton = document.getElementById('cancelCreateButton');
 const applicationForm = document.getElementById('applicationForm');
 const nameInput = document.getElementById('applicationName');
-const name = document.getElementById('applicationName').value;
+/* Dropped: `const name = document.getElementById('applicationName').value;`. It read the
+   field at parse time, so it was always the empty string, and nothing used it - the submit
+   handler reads the value again when it fires. It was also the one unguarded dereference
+   left at module scope, which would have taken the whole script down on any page that
+   loads it without a create form. */
 
 let hasStartTyping = false;
 
-function showApplicationForm() {
-    if (formView) {
-        formView.classList.remove('d-none');
-        plusCard.classList.add('d-none');
-    }
+/* The form is a dialog now, not a card expanded in the grid.
+
+   The old showApplicationForm / toggleCreateCard / hideApplicationForm are gone. They
+   existed only as onclick targets in applications-listing.hbs, which now binds through
+   addEventListener instead. Dropping showApplicationForm also removes a real hazard: this
+   file and subscription.js both declared a top-level function of that name, and both are
+   loaded together on the apis, api-landing and mcp pages, where whichever parsed last
+   silently won. subscription.js's is the one those pages mean. */
+
+function openCreateModal() {
+    if (!createModal) return;
+    // Always open on a clean form: the dialog persists in the DOM between opens.
+    if (applicationForm) applicationForm.reset();
+    hasStartTyping = false;
+    if (nameError) nameError.classList.add('d-none');
+    if (descriptionError) descriptionError.style.display = 'none';
+    if (remainingCharactersSpan) remainingCharactersSpan.textContent = '256';
+    if (saveButton) saveButton.disabled = true;
+    createModal.classList.add('show');
+    document.body.classList.add('app-modal-open');
+    // After the class lands, or focus() runs against a display:none subtree.
+    setTimeout(() => nameInput?.focus(), 60);
 }
 
-function toggleCreateCard() {
-    if (wrapper && formView) {
-        wrapper.classList.remove('d-none');
-        formView.classList.remove('d-none');
-        createButton.disabled = true;
-        if (plusCard) {
-            plusCard.classList.add('d-none');
-        }
-        wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+function closeCreateModal() {
+    if (!createModal) return;
+    createModal.classList.remove('show');
+    document.body.classList.remove('app-modal-open');
 }
 
-function hideApplicationForm(el) {
-    const hasApps = el.getAttribute('data-has-apps') === 'true';
-    if (wrapper && formView) {
-        formView.classList.add('d-none');
-        hasStartTyping = false;
-        if (hasApps) {
-            createButton.disabled = false;
-            wrapper.classList.add('d-none');
-            plusCard.classList.add('d-none');
-        } else {
-            wrapper.classList.remove('d-none');
-            plusCard.classList.remove('d-none');
-        }
-    }
-}
 
 // Function to show loading state on Create button
 window.showCreateButtonLoading = function (button) {
@@ -118,11 +118,34 @@ document.addEventListener('DOMContentLoaded', () => {
         validateForm();
     });
 
-    if (createButton) {
-        cancelButton.addEventListener('click', () => {
-            closeModal('createAppModal');
-        });
-    }
+    /* Was `closeModal('createAppModal')`, which threw: closeModal is defined in
+       subscription.js, and the applications page does not load it. It also pointed at the
+       shared create-app partial's dialog rather than this page's own form.
+       No longer gated on the header create button existing either - that button is absent
+       on an empty portal, where the dialog opens from the empty state, and the gate left
+       Cancel dead there. */
+    cancelButton?.addEventListener('click', closeCreateModal);
+    createModalClose?.addEventListener('click', closeCreateModal);
+
+    /* Delegated rather than bound to the two elements: both live inside
+       #applicationsContainer, which refreshApplicationsList replaces wholesale after a
+       create. Bound listeners would go with the old nodes and the button would die after
+       the first application - the empty-state one especially, since creating from it is
+       exactly what swaps it away. */
+    document.addEventListener('click', (event) => {
+        if (event.target.closest('#createButton, #createButtonEmpty')) openCreateModal();
+    });
+
+    // Click the backdrop, not the dialog, to dismiss.
+    createModal?.addEventListener('click', (event) => {
+        if (event.target === createModal) closeCreateModal();
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && createModal?.classList.contains('show')) {
+            closeCreateModal();
+        }
+    });
 
     document
         .getElementById('applicationForm')
@@ -132,6 +155,20 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
+    /* Shown after the reload that follows a successful create. alert.js is loaded by the
+       alert partial, which this page renders, and both scripts are deferred - so showAlert
+       is defined by the time this runs. Guarded anyway: the partial is not on every page
+       that loads this script. */
+    const createdParam = new URLSearchParams(window.location.search).get('created');
+    if (createdParam === 'success') {
+        if (typeof showAlert === 'function') {
+            showAlert('Application created successfully!', 'success');
+        }
+        const cleanUrl = new URL(window.location.href);
+        cleanUrl.searchParams.delete('created');
+        window.history.replaceState({}, document.title, cleanUrl.toString());
+    }
+
     // Initialize the character count and form validation on page load
     const remaining = Math.max(
         0,
@@ -140,6 +177,39 @@ document.addEventListener('DOMContentLoaded', () => {
     remainingCharactersSpan.textContent = remaining;
     validateForm();
 });
+
+/* Re-renders the applications list in place of a page load.
+
+   The page is fetched again and only #applicationsContainer is swapped in, so the markup
+   is still the server's - the new card, its subscription count, the empty state giving way
+   to the grid, the header's Create button appearing with the first application. Nothing
+   here builds a card, so nothing can drift from what a reload would have shown.
+
+   Everything inside the container is reached by inline onclick or by delegation, so the
+   swap leaves nothing unbound. If the fetch fails, or the response is not this page any
+   more - a session that has expired into a login redirect - it falls back to the reload
+   this replaced rather than leaving a stale list on screen. */
+async function refreshApplicationsList() {
+    try {
+        const response = await fetch(window.location.href, {
+            credentials: 'same-origin',
+            headers: { Accept: 'text/html' },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const next = doc.getElementById('applicationsContainer');
+        const current = document.getElementById('applicationsContainer');
+        if (!next || !current) throw new Error('applications container not in the response');
+
+        current.replaceWith(next);
+        return true;
+    } catch (error) {
+        console.error('Could not refresh the applications list:', error);
+        window.location.reload();
+        return false;
+    }
+}
 
 // Submittion of the form
 applicationForm.addEventListener('submit', async (e) => {
@@ -169,17 +239,20 @@ applicationForm.addEventListener('submit', async (e) => {
             throw new Error(`HTTP error! Status: ${response.status}`);
         }
 
-        const responseData = await response.json();
-        const messageOverlay = document.getElementById('message-overlay');
-        if (messageOverlay && typeof window.showAppMessage === 'function') {
-            window.showAppMessage(
-                messageOverlay,
-                responseData.message || 'Application created successfully!',
-                'success',
-            );
+        await response.json();
+
+        /* The dialog says nothing on success; the confirmation is the portal's own
+           bottom-right alert, and the new card simply appears.
+
+           The list still comes from the server - refreshApplicationsList re-fetches this
+           page and swaps the container - so there is no client-built card to keep in step
+           with what the server would have rendered. What is gone is the page load: the
+           scroll position, and the white flash, stay put. */
+        closeCreateModal();
+        await refreshApplicationsList();
+        if (typeof showAlert === 'function') {
+            showAlert('Application created successfully!', 'success');
         }
-        saveButton.innerHTML = `<i class="bi bi-check-circle-fill me-2"></i>Created`;
-        window.location.reload();
     } catch (error) {
         resetButtonState(saveButton);
         console.error('Error saving application:', error);

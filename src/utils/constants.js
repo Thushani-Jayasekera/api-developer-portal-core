@@ -85,6 +85,9 @@ module.exports = {
         PNG: 'image/png',
         JPEG: 'image/jpeg',
         SVG: 'image/svg+xml',
+        GIF: 'image/gif',
+        ICO: 'image/x-icon',
+        WEBP: 'image/webp',
         PDF: 'application/pdf',
         CONYEMT_TYPE_OCT: 'application/octet-stream',
         CONYEMT_TYPE: 'Content-Type',
@@ -110,6 +113,8 @@ module.exports = {
         HBS: '.hbs',
         MD: '.md',
         GIF: '.gif',
+        ICO: '.ico',
+        WEBP: '.webp',
         YAML: '.yaml',
         YML: '.yml',
         XML: '.xml'
@@ -118,6 +123,10 @@ module.exports = {
         INTERNAL_KEY_MANAGER: '_internal_key_manager',
         RESIDENT_KEY_MANAGER: 'Resident Key Manager',
         APP_DEV_STS_KEY_MANAGER: '_appdev_sts_key_manager_',
+    },
+    DEV_PORTAL_APP_ENV: {
+        PROD: 'prod',
+        SANDBOX: 'sandbox',
     },
     TOKEN_TYPES: {
         API_KEY: 'API_KEY',
